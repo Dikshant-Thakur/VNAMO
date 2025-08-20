@@ -1,0 +1,25 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: mir_description
+    relative_path: urdf/mir.urdf.xacro
+  srdf:
+    relative_path: config/mir_250.srdf
+  package_settings:
+    author_name: Dikshant
+    author_email: dikshantthakur12@gmail.com
+    generated_timestamp: 1754294399
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
