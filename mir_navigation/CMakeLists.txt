@@ -22,6 +22,15 @@ find_package(navigation2 REQUIRED)
 find_package(slam_toolbox REQUIRED)
 find_package(action_msgs REQUIRED)
 
+# ArUco Detection Dependencies
+find_package(rclcpp REQUIRED)
+find_package(rclpy REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(OpenCV REQUIRED)
+find_package(image_transport REQUIRED)
 
 ## Generate service interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -54,6 +63,17 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-# Export dependencies
-ament_export_dependencies(rosidl_default_runtime)
+# Export dependencies - UPDATE THIS
+ament_export_dependencies(
+  rosidl_default_runtime
+  rclcpp
+  rclpy
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  cv_bridge
+  OpenCV
+  image_transport
+)
+
 ament_package()
