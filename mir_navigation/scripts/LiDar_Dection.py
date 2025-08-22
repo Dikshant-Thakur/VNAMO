@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
 import cv2
 import numpy as np
 from cv_bridge import CvBridge
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage  # CompressedImage added
 from std_msgs.msg import String, Bool
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
 
@@ -16,59 +15,61 @@ class ArucoDetectorNode(Node):
         # CvBridge
         self.bridge = CvBridge()
         
-        # ArUco Setup - आपकी same dictionary
+        # ArUco Setup
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
         self.aruco_params = cv2.aruco.DetectorParameters()
         
         # Camera parameters
         self.camera_matrix = None
         self.dist_coeffs = None
-        
-        # Marker size (adjust करें जरूरत के हिसाब से)
         self.marker_size = 0.2  # 20cm
         
-        # Subscribers
+        # COMPRESSED IMAGE SUBSCRIBER - CHANGED
         self.image_sub = self.create_subscription(
-            Image, 
-            '/realsense/camera/color/image_raw',  # Change topic according to your camera
-            self.image_callback, 
+            CompressedImage,  # Changed from Image
+            '/realsense/camera/color/image_raw/compressed',  # Compressed topic
+            self.compressed_image_callback,  # New callback
             qos_profile_sensor_data
         )
         
+        # Camera info (same)
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
-            '/realsense/camera/color/camera_info',  # Change topic according to your camera
+            '/realsense/camera/color/camera_info',
             self.camera_info_callback,
             10
         )
         
-        # Publishers
+        # Publishers (same)
         self.detection_pub = self.create_publisher(Bool, '/aruco_detected', 10)
         self.marker_info_pub = self.create_publisher(String, '/marker_info', 10)
         
-        # Status variables
         self.markers_detected = False
         self.detection_count = 0
         
-        self.get_logger().info('🎯 ArUco Detector Node Started!')
+        self.get_logger().info('🎯 ArUco Detector Node Started (COMPRESSED)!')
         self.get_logger().info('📏 Dictionary: DICT_6X6_250')
-        self.get_logger().info('📐 Marker Size: 20cm')
-        self.get_logger().info('🎥 Waiting for camera feed...')
-    
+        self.get_logger().info('🎥 Using COMPRESSED images...')
+
     def camera_info_callback(self, msg):
         """Get camera calibration parameters"""
         if self.camera_matrix is None:
             self.camera_matrix = np.array(msg.k).reshape(3, 3)
             self.dist_coeffs = np.array(msg.d)
             self.get_logger().info('✅ Camera calibration received!')
-    
-    def image_callback(self, msg):
-        """Main detection callback"""
+
+    def compressed_image_callback(self, msg):
+        """Handle COMPRESSED images"""
         try:
-            # Convert ROS image to OpenCV format
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # DECODE COMPRESSED IMAGE - KEY STEP
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
-            # Convert to grayscale
+            if cv_image is None:
+                self.get_logger().error('❌ Failed to decode compressed image!')
+                return
+            
+            # बाकी सब same detection logic
             gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
             
             # Detect ArUco markers
@@ -81,7 +82,6 @@ class ArucoDetectorNode(Node):
             detection_msg.data = False
             
             if ids is not None:
-                # Markers detected!
                 detection_msg.data = True
                 self.markers_detected = True
                 self.detection_count += 1
@@ -127,7 +127,7 @@ class ArucoDetectorNode(Node):
                         self.marker_info_pub.publish(info_msg)
                 
                 # Status display
-                cv2.putText(cv_image, f"Found: {len(ids)} markers", 
+                cv2.putText(cv_image, f"Found: {len(ids)} markers (COMPRESSED)", 
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.putText(cv_image, f"Total detections: {self.detection_count}", 
                            (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -135,28 +135,26 @@ class ArucoDetectorNode(Node):
             else:
                 # No markers detected
                 detection_msg.data = False
-                cv2.putText(cv_image, "No markers detected", 
+                cv2.putText(cv_image, "No markers detected (COMPRESSED)", 
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             
             # Always publish detection status
             self.detection_pub.publish(detection_msg)
             
-            # Display image (optional - comment out if not needed)
-            cv2.putText(cv_image, "ArUco Detection - DICT_6X6_250", 
+            # Display image
+            cv2.putText(cv_image, "ArUco Detection - COMPRESSED", 
                        (10, cv_image.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.imshow('ArUco Detection', cv_image)
             cv2.waitKey(1)
             
         except Exception as e:
-            self.get_logger().error(f'❌ Error in image callback: {str(e)}')
-    
+            self.get_logger().error(f'❌ Compressed image callback error: {str(e)}')
+
     def __del__(self):
         cv2.destroyAllWindows()
 
 def main(args=None):
     rclpy.init(args=args)
-    
-    # Create and run the node
     detector_node = ArucoDetectorNode()
     
     try:
@@ -164,7 +162,6 @@ def main(args=None):
     except KeyboardInterrupt:
         detector_node.get_logger().info('🛑 Shutting down ArUco Detector...')
     finally:
-        # Cleanup
         cv2.destroyAllWindows()
         detector_node.destroy_node()
         rclpy.shutdown()
