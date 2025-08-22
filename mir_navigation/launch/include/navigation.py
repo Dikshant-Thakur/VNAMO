@@ -144,6 +144,7 @@ def generate_launch_description():
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings + [('cmd_vel', command_topic)]),
+                
             Node(
                 package='nav2_smoother',
                 executable='smoother_server',
