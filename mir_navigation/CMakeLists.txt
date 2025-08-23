@@ -74,6 +74,8 @@ ament_export_dependencies(
   cv_bridge
   OpenCV
   image_transport
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 ament_package()
