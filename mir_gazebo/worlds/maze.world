@@ -21,7 +21,7 @@
       <link name="box_link">
         <collision name="collision">
           <geometry>
-            <box><size>0.5 2.0 0.25</size></box>
+            <box><size>0.5 2.0 0.5</size></box>
           </geometry>
           <surface>
             <friction><ode><mu>0.1</mu><mu2>0.1</mu2></ode></friction>
@@ -29,7 +29,7 @@
         </collision>
         <visual name="visual">
           <geometry>
-            <box><size>0.5 2.0 0.25</size></box>
+            <box><size>0.5 2.0 0.5</size></box>
           </geometry>
           <material>
             <ambient>0.8 0.2 0.2 1</ambient>
@@ -49,7 +49,7 @@
       <!-- Include ArUco marker separately -->
       <include>
         <uri>model://marker_0</uri>
-        <pose>-0.25 0 -0.125 0 0 0</pose> <!-- Right face पर -->
+        <pose>-0.25 0 -0.25 0 0 0</pose> <!-- Right face पर -->
         <name>box_marker</name>
       </include>
       
