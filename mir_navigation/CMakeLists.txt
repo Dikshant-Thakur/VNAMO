@@ -32,6 +32,11 @@ find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(image_transport REQUIRED)
 
+#YOLO
+find_package(vision_msgs REQUIRED)
+
+
+
 ## Generate service interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/ManipulateBox.action"
@@ -49,6 +54,10 @@ install(PROGRAMS scripts/Planner_explanation.py
 )
 
 install(PROGRAMS scripts/LiDar_Dection.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS scripts/yolo_detector.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -76,6 +85,7 @@ ament_export_dependencies(
   image_transport
   tf2_ros
   tf2_geometry_msgs
+  vision_msgs
 )
 
 ament_package()

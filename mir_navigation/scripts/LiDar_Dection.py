@@ -4,6 +4,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
+import threading, time
+
 import cv2
 import numpy as np
 
@@ -13,7 +15,7 @@ from std_msgs.msg import String, Bool
 from rclpy.qos import qos_profile_sensor_data
 
 import tf2_ros
-from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped, Pose, Vector3
+from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped, Pose, Vector3, Twist
 import tf2_geometry_msgs
 
 from nav2_simple_commander import robot_navigator
@@ -51,6 +53,9 @@ class ArucoDetectorWithMoveIt(Node):
         # Planning tolerances
         self.ORI_TOL = 0.17    # rad (~6 deg)
         self.POS_TOL = 0.1     # m (sphere radius for rotate-in-place)
+
+        #Stop the robot
+        self.cmd_pub = self.create_publisher(Twist, '/diff_cont/cmd_vel_unstamped', 10)
 
         # TF behaviour
         self.require_camera_tf = True  # if False, fall back to tool+X yaw/pitch aiming
@@ -100,6 +105,18 @@ class ArucoDetectorWithMoveIt(Node):
 
         self.alignment_tolerance = 0.05
         self.get_logger().info('🤖 ArUco Detector with MoveIt2 (Nav2 + camera look-at rotate-in-place)')
+
+    # ---------------- Mobile Base stop ----------------
+    def hold_base_still_async(self, duration_sec: float = 2.0, rate_hz: float = 20.0):
+        """UR5e motion ke baad base ko actively 0 vel pe hold karta hai."""
+        def _run():
+            twist = Twist()  # sab default 0: linear=0, angular=0
+            period = 1.0 / float(rate_hz)
+            stop_t = time.time() + duration_sec
+            while time.time() < stop_t and rclpy.ok():
+                self.cmd_pub.publish(twist)
+                time.sleep(period)
+        threading.Thread(target=_run, daemon=True).start()
 
     # ---------------- Camera calib ----------------
     def camera_info_callback(self, msg):
@@ -182,10 +199,10 @@ class ArucoDetectorWithMoveIt(Node):
         Build rotation matrix so camera +Z looks at target with roll 'upright' w.r.t world up (0,0,1).
         Returns R_w_c (world->camera) as 3x3.
         """
-        f, _ = self._normalize(target_world_p - cam_world_p)   # forward (+Z of camera)
+        f, _ = self._normalize(target_world_p - cam_world_p)   # unit forward vector from cam to target.
         up_w = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        if abs(np.dot(f, up_w)) > 0.99:
-            up_w = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        if abs(np.dot(f, up_w)) > 0.99: #check if forward is nearly parallel to world up, 0.99 means angle is less than ~8.1 degrees. 0.142 radians.
+            up_w = np.array([0.0, 1.0, 0.0], dtype=np.float64) #change to Y from z up.
 
         r = np.cross(up_w, f); r, _ = self._normalize(r)       # camera +X (right)
         u = np.cross(f, r);   u, _ = self._normalize(u)        # camera +Y (up)
@@ -194,7 +211,7 @@ class ArucoDetectorWithMoveIt(Node):
 
         # ---- Uprightness enforcement (anti-upside-down) ----
         # Keep camera's up (~column 1) aligned with world up; if inverted, flip roll 180°.
-        if np.dot(R_w_c[:, 1], up_w) > 0.0:
+        if np.dot(R_w_c[:, 1], up_w) > 0.0: #+y(cam) should be oppoesite to +z(world) for seedhe image.     
             R_w_c[:, 0] *= -1.0
             R_w_c[:, 1] *= -1.0
         return R_w_c
@@ -392,6 +409,8 @@ class ArucoDetectorWithMoveIt(Node):
             self.alignment_active = False
             if result.error_code.val == 1:
                 self.get_logger().info('✅ Camera aligned to marker (rotation complete)')
+                # 👉 UR5e complete → base ko 0-vel pe actively hold karo
+                self.hold_base_still_async(duration_sec=2.0, rate_hz=20.0)
             else:
                 self.get_logger().error(f'❌ Rotate-in-place failed: error_code={result.error_code.val}')
         except Exception as e:
