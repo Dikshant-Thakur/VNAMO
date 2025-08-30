@@ -57,14 +57,6 @@ install(PROGRAMS scripts/LiDar_Dection.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(PROGRAMS scripts/yolo_detector.py
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(PROGRAMS scripts/test_file.py
-  DESTINATION lib/${PROJECT_NAME}
-  RENAME test_file
-)
 
 # Tests (optional)
 if(BUILD_TESTING)

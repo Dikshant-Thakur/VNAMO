@@ -60,13 +60,13 @@ class YoloDetector(Node):
             "image_topic", "/realsense/camera/color/image_raw/compressed"
         )
         # Accept string ("cpu", "cuda:0", "auto") or int (0/1/...)
-        self.declare_parameter("device", "auto")
+        self.declare_parameter("device", "auto") #auto means decide yourself GPU or CPU. 
         self.declare_parameter("imgsz", 768)
         self.declare_parameter("conf", 0.35)
         self.declare_parameter("iou", 0.6)
         self.declare_parameter("publish_image", True)
-        self.declare_parameter("overlay_topic", "/yolo/overlay")
-        self.declare_parameter("detections_topic", "/yolo/detections")
+        self.declare_parameter("overlay_topic", "/yolo/overlay") #is topic me image dikhegi with bbox
+        self.declare_parameter("detections_topic", "/yolo/detections") #is topic mein sirf details hai without image.
 
         model_path = (
             self.get_parameter("model_path").get_parameter_value().string_value
@@ -87,9 +87,9 @@ class YoloDetector(Node):
                 device_value = "auto"
 
         self.device = _normalize_device_param(device_value)
-        self.imgsz = int(self.get_parameter("imgsz").get_parameter_value().integer_value)
-        self.conf = float(self.get_parameter("conf").get_parameter_value().double_value)
-        self.iou = float(self.get_parameter("iou").get_parameter_value().double_value)
+        self.imgsz = int(self.get_parameter("imgsz").get_parameter_value().integer_value) #image size
+        self.conf = float(self.get_parameter("conf").get_parameter_value().double_value) #confidence threshold
+        self.iou = float(self.get_parameter("iou").get_parameter_value().double_value) #IoU threshold
         self.pub_img = bool(
             self.get_parameter("publish_image").get_parameter_value().bool_value
         )
@@ -103,9 +103,10 @@ class YoloDetector(Node):
         # ---------------- Model ----------------
         try:
             self.model = YOLO(model_path)
-            # Use requested device; Ultralytics will dispatch appropriately
-            # (No .to(device) needed; we pass device at predict-time)
+            # Jb predict chlta hai to ye apne aap model ko device pe le jata hai.
+            # But we can also do it manually here if needed, par abhi hm wo nhi kar rhe..
             self.model.fuse()  # small speedup
+            # Conv + BN → ek single optimized Conv layer ban jaata hai.
             self.get_logger().info(
                 f"YOLO model loaded and fused: {model_path} | device={self.device}"
             )
@@ -114,7 +115,7 @@ class YoloDetector(Node):
             raise
 
         # ---------------- Bridge & pubs/subs ----------------
-        self.bridge = CvBridge()
+        self.bridge = CvBridge() #ROS Image messages ↔ OpenCV images (numpy array).
         self.pub_det = self.create_publisher(Detection2DArray, detections_topic, 10)
         self.pub_overlay = None
         if self.pub_img:
@@ -144,7 +145,7 @@ class YoloDetector(Node):
 
         try:
             buf = np.frombuffer(msg.data, np.uint8)
-            frame_bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)  # Decodes to BGR
+            frame_bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)  # Decodes to BGR, 
             if frame_bgr is None:
                 self.get_logger().warn("cv2.imdecode returned None, skipping frame")
                 return
@@ -173,10 +174,10 @@ class YoloDetector(Node):
             return
 
         r = results[0]  # Ultralytics returns List[Results]; work on first
-        boxes = r.boxes  # Boxes object
-        names = r.names if hasattr(r, "names") else None  # {cls_id: "label"} usually
+        boxes = r.boxes  # Boxes object, bbox + attributes. 
+        names = r.names if hasattr(r, "names") else None  # check names attribute is in r object or not. 
 
-        det_arr = Detection2DArray()
+        det_arr = Detection2DArray() #information type/container for 2D multi-detections (could be one detection or multiple.)
         det_arr.header = header
 
         overlay = frame_bgr.copy()
@@ -184,25 +185,25 @@ class YoloDetector(Node):
         try:
             if boxes is not None and len(boxes) > 0:
                 # Tensors: (N,4), (N,), (N,)
-                xyxy = boxes.xyxy  # x1,y1,x2,y2
+                xyxy = boxes.xyxy  # x1,y1,x2,y2 gives co-ordinates of bbox.
                 conf = boxes.conf if hasattr(boxes, "conf") else None
                 cls = boxes.cls if hasattr(boxes, "cls") else None
 
-                n = xyxy.shape[0]
+                n = xyxy.shape[0] # .shape(3,4) - means 3 boxes detected and each box has 4 coordinates.
                 for i in range(n):
-                    x1, y1, x2, y2 = [float(v) for v in xyxy[i].tolist()]
-                    score = float(conf[i].item()) if conf is not None else 0.0
+                    x1, y1, x2, y2 = [float(v) for v in xyxy[i].tolist()] #tolist - from tensor to normal list.
+                    score = float(conf[i].item()) if conf is not None else 0.0 #.item() - from tensor single to normal single value.
                     cls_id = int(cls[i].item()) if cls is not None else 0
                     label = None
-                    if isinstance(names, dict):
+                    if isinstance(names, dict): #YOLOv8 trained on COCO dataset, so names is dict.
                         label = names.get(cls_id, str(cls_id))
-                    elif isinstance(names, list) and 0 <= cls_id < len(names):
+                    elif isinstance(names, list) and 0 <= cls_id < len(names): #Custom trained model, so names is list.
                         label = names[cls_id]
                     else:
                         label = str(cls_id)
 
                     # ---- vision_msgs Detection2D ----
-                    det = Detection2D()
+                    det = Detection2D() #for single detection.
                     det.header = header
 
                     hyp = ObjectHypothesisWithPose()
@@ -244,9 +245,11 @@ class YoloDetector(Node):
             self.get_logger().error(f"Publishing detections failed: {e}")
 
         # ---- Publish overlay (raw Image)
+        # pub_img - flag for data publish krna(ROS messages) jisme sirf class_id, confidence, bbox (center+size).
+        # pub_overlay - flag for data publish krna(ROS messages) jisme image with bbox draw hua h.
         if self.pub_img and self.pub_overlay is not None:
             try:
-                msg_out = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")
+                msg_out = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8") #OpenCV image (overlay) to ROS Image
                 msg_out.header = header
                 self.pub_overlay.publish(msg_out)
             except Exception as e:
