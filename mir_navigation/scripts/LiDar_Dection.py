@@ -9,6 +9,9 @@ import threading, time
 import cv2
 import numpy as np
 
+from rclpy.executors import MultiThreadedExecutor
+import yolo_detector as yp 
+
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CameraInfo, CompressedImage
 from std_msgs.msg import String, Bool
@@ -43,6 +46,9 @@ class ArucoDetectorWithMoveIt(Node):
         self.bridge = CvBridge()
         self.navigator = robot_navigator.BasicNavigator()
         self.navigator.waitUntilNav2Active()
+
+        self.yolo_node = yp.YoloDetector()   # YOLO node construct
+        self.yolo_node.set_enabled(False)    # start me band (order gate)
 
         # === Frames & planning params (tweak as needed) ===
         self.BASE_FRAME = "ur_base_link"
@@ -400,6 +406,10 @@ class ArucoDetectorWithMoveIt(Node):
             self.get_logger().error('❌ MoveIt2 goal rejected')
             return
         self.get_logger().info('✅ MoveIt2 goal accepted')
+        try:
+            self.yolo_node.set_enabled(True)
+        except Exception as e:
+            self.get_logger().error(f'Enable YOLO failed: {e}')
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.moveit_result_callback)
 
@@ -492,12 +502,18 @@ class ArucoDetectorWithMoveIt(Node):
 def main(args=None):
     rclpy.init(args=args)
     detector_node = ArucoDetectorWithMoveIt()
+    yolo_node = detector_node.yolo_node
+    exec = MultiThreadedExecutor(num_threads=2)  # camera+YOLO parallel
+    exec.add_node(detector_node)
+    exec.add_node(yolo_node)
+
     try:
-        rclpy.spin(detector_node)
+        exec.spin()
     except KeyboardInterrupt:
-        detector_node.get_logger().info('🛑 Shutting down ArUco Detector with MoveIt2...')
+        detector_node.get_logger().info('🛑 Shutting down...')
     finally:
-        cv2.destroyAllWindows()
+        exec.shutdown()
+        yolo_node.destroy_node()
         detector_node.destroy_node()
         rclpy.shutdown()
 
