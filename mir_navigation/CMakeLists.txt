@@ -61,6 +61,9 @@ install(PROGRAMS scripts/yolo_detector.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS scripts/push.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 # Tests (optional)
 if(BUILD_TESTING)
