@@ -301,6 +301,99 @@ class PushOrchestrator(Node):
     
     # --- Add this function inside the class PushOrchestrator ---
 
+
+    def _go_side_peek_obstacle_side(self,
+                                plan_dir: str,
+                                reach_wait_s: float = 15.0,
+                                peek_forward: float = 0.25,
+                                extra_buffer_m: float = None) -> bool:
+        """
+        Make two NAV goals *anchored at the obstacle side* (not robot side):
+        1) Anchor = box center nudged 'peek_forward' along push direction
+        2) Left/Right offsets so robot stands beside the box (outside corridor)
+        3) Try nearer first; wait up to 'reach_wait_s' to reach; on timeout cancel & try other
+        4) Return True if any reached; else False
+        """
+        # --- Direction basis ---
+        (_, _), yaw_dir = self._dir_unit_and_yaw(plan_dir)
+        fx, fy = math.cos(yaw_dir), math.sin(yaw_dir)           # forward (push dir)
+        ux, uy = -math.sin(yaw_dir), math.cos(yaw_dir)          # left (perp)
+
+        # --- Box center (anchor near obstacle) ---
+        bx, by = self.box['x'], self.box['y']                   # already in your class
+        ax = bx + peek_forward * fx
+        ay = by + peek_forward * fy
+
+        # --- Corridor width per push axis ---
+        if plan_dir in ('+X', '-X'):
+            corridor_W = max(self.robot_W, self.box['W'])
+        else:  # '+Y' / '-Y'
+            corridor_W = max(self.robot_L, self.box['L'])
+
+        # --- Safe side offset (corridor edge + half robot + buffer) ---
+        buf_param = float(self.get_parameter('buffer_m').get_parameter_value().double_value)
+        buf = extra_buffer_m if (extra_buffer_m is not None) else buf_param
+        offset = 0.5 * corridor_W + 0.5 * self.robot_W + buf
+
+        # --- Left/Right targets facing down the corridor ---
+        targets = {
+            'left':  (ax + offset * ux, ay + offset * uy, yaw_dir),
+            'right': (ax - offset * ux, ay - offset * uy, yaw_dir),
+        }
+
+        # --- Try nearer first (from current robot pose) ---
+        rx, ry = (self.robot_pose[0], self.robot_pose[1]) if self.robot_pose else (ax, ay)
+        order = sorted(targets.items(), key=lambda kv: (kv[1][0]-rx)**2 + (kv[1][1]-ry)**2)
+
+        for tag, (tx, ty, tyaw) in order:
+            self.get_logger().info(
+                f"[SCOUT] Obstacle-side {tag}: target=({tx:.2f},{ty:.2f},{math.degrees(tyaw):.1f}deg), "
+                f"offset={offset:.2f} m, peek_fwd={peek_forward:.2f} m"
+            )
+            goal = self._build_nav_goal(tx, ty, tyaw)
+            gh = self._send_and_wait_accept(goal)
+            if gh is None:
+                self.get_logger().warn(f"[SCOUT] {tag}: goal not accepted.")
+                continue
+
+            # --- Wait up to reach_wait_s to *reach*; if not, cancel & try other ---
+            result_future = gh.get_result_async()
+            t0 = time.monotonic()
+            reached = False
+            while rclpy.ok() and (time.monotonic() - t0) < max(0.0, reach_wait_s):
+                rclpy.spin_once(self, timeout_sec=0.05)
+                if result_future.done():
+                    try:
+                        result = result_future.result()
+                        status = getattr(result, "status", None)
+                    except Exception as e:
+                        self.get_logger().warn(f"[SCOUT] {tag}: result read error: {e}")
+                        status = None
+                    if status == GoalStatus.STATUS_SUCCEEDED:
+                        self.get_logger().info(f"[SCOUT] {tag}: reached ✅")
+                        reached = True
+                    else:
+                        self.get_logger().warn(f"[SCOUT] {tag}: status={status}")
+                    break
+
+            if not reached and (time.monotonic() - t0) >= reach_wait_s:
+                self.get_logger().warn(f"[SCOUT] {tag}: timeout {reach_wait_s:.1f}s → cancel.")
+                try:
+                    cancel_future = gh.cancel_goal_async()
+                    t_cancel0 = time.monotonic()
+                    while rclpy.ok() and not cancel_future.done() and (time.monotonic() - t_cancel0) < 2.0:
+                        rclpy.spin_once(self, timeout_sec=0.05)
+                except Exception as e:
+                    self.get_logger().warn(f"[SCOUT] {tag}: cancel error: {e}")
+
+            if reached:
+                return True
+
+        self.get_logger().warn("[SCOUT] Both obstacle-side goals failed → ABORT.")
+        return False
+
+
+
     def _approach_contact(self, plan_dir: str, K: float):
         """
         Softly drive forward from pre-manip until contact is confirmed.
@@ -475,40 +568,75 @@ class PushOrchestrator(Node):
     # --- Add this function inside the class PushOrchestrator ---
     def _correct_orientation_inplace(self, plan_dir: str) -> bool:
         """
-        Rotate robot in-place to match expected direction.
+        Simple closed-loop: keep rotating in place until yaw ≈ target.
+        No extra parameters; hardcoded small tolerance & speeds.
         """
-        if self.robot_pose is None:
+        import math, time
+        from geometry_msgs.msg import Twist
+
+        # target yaw from your existing helper
+        _, yaw_ref = self._dir_unit_and_yaw(plan_dir)
+
+        # local helper to wrap angle to [-pi, pi]
+        def wrap(a: float) -> float:
+            return math.atan2(math.sin(a), math.cos(a))
+
+        # choose pose source (prefer odom if available)
+        pose = self.odom_pose if self.odom_pose is not None else self.robot_pose
+        if pose is None:
+            self.get_logger().warn("[ORIENT] No pose available.")
             return False
-        
-        _, _, current_yaw = self.robot_pose
-        _, expected_yaw = self._dir_unit_and_yaw(plan_dir)
-        
-        yaw_diff = clamp_angle(expected_yaw - current_yaw)
-        yaw_tolerance = math.radians(5.0)  # 10 degrees
-        
-        if abs(yaw_diff) <= yaw_tolerance:
-            return True
-        
-        self.get_logger().info(f"[ORIENT] Rotating {math.degrees(yaw_diff):.1f}° in-place...")
-        
-        # Determine rotation direction and speed
-        angular_speed = 0.3 if yaw_diff > 0 else -0.3  # rad/s
-        rotation_time = abs(yaw_diff) / 0.3  # time to rotate
-        
-        # Publish rotation command
-        twist = Twist()
-        twist.angular.z = angular_speed
-        
-        start_time = time.monotonic()
-        while (time.monotonic() - start_time) < rotation_time:
-            self.cmd_pub.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.05)
-        
-        # Stop rotation
-        self._stop()
-        time.sleep(0.5)  # Let it settle
-        
-        return True
+
+        tol = math.radians(5.0)   # ~5°
+        kp  = 1.0                 # simple proportional
+        w_max = 0.5               # rad/s cap
+        w_min = 0.12              # minimum to break static friction
+
+        t0 = time.monotonic()
+        timeout_s = 5.0
+        dt = 0.03                 # ~33 Hz
+
+        while True:
+            # refresh latest yaw
+            pose = self.odom_pose if self.odom_pose is not None else self.robot_pose
+            if pose is None:
+                # stop and fail gracefully
+                z = Twist(); self.cmd_pub.publish(z)
+                return False
+
+            yaw_now = pose[2]
+            e = wrap(yaw_ref - yaw_now)
+
+            # done?
+            if abs(e) <= tol:
+                z = Twist()  # stop
+                self.cmd_pub.publish(z)
+                return True
+
+            # simple P -> omega, with clamp + minimum magnitude
+            w = kp * e
+            if w >  w_max: w =  w_max
+            if w < -w_max: w = -w_max
+            if abs(w) < w_min:
+                w = math.copysign(w_min, w)
+
+            cmd = Twist()
+            cmd.linear.x = 0.0
+            cmd.angular.z = w
+            self.cmd_pub.publish(cmd)
+
+            # let callbacks run a bit & pace the loop
+            try:
+                rclpy.spin_once(self, timeout_sec=0.0)
+            except Exception:
+                pass
+            time.sleep(dt)
+
+            # simple watchdog
+            if (time.monotonic() - t0) > timeout_s:
+                z = Twist(); self.cmd_pub.publish(z)
+                self.get_logger().warn("[ORIENT] Timeout; aborting.")
+                return False
 
 
     def _do_push_from_contact(self, plan_dir: str, K: float, s_origin: float, cap: float) -> bool:
@@ -716,6 +844,24 @@ class PushOrchestrator(Node):
 
             # (Yaw alignment check removed as requested)
             self.get_logger().info(f"[NAV] Reached pre-manip for {dtag} ✅")
+            pre_x, pre_y, pre_yaw = x, y, yaw
+
+            ok_view = self._go_side_peek_obstacle_side(
+                plan['dir'],            # chosen push direction
+                reach_wait_s=15.0,      # wait to *reach* each side for up to 15 s
+                peek_forward=0.25,      # nudge anchor slightly ahead of box face
+                extra_buffer_m=0.12     # keep robot outside the corridor edge
+            )
+            if not ok_view:
+                self.get_logger().warn("[SCOUT] Side-peek both points failed → trying next direction.")
+                continue
+            # Return to pre-manip before starting approach
+            goal_back = self._build_nav_goal(pre_x, pre_y, pre_yaw)
+            gh_back   = self._send_and_wait_accept(goal_back)
+            if gh_back is None or self._wait_nav_result(gh_back) != GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().warn("[NAV] Could not return to pre-manip. Trying next direction.")
+                continue
+                
             # LOCK final direction and push
             ok, s_origin, cap_from_contact = self._approach_contact(plan['dir'], plan['K'])
             if not ok:
