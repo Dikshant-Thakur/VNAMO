@@ -40,7 +40,8 @@ find_package(vision_msgs REQUIRED)
 ## Generate service interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/ManipulateBox.action"
-  DEPENDENCIES builtin_interfaces action_msgs
+  "srv/VisibilityCheck.srv"
+  DEPENDENCIES builtin_interfaces action_msgs std_msgs geometry_msgs
 )
 
 # Install resources
@@ -54,6 +55,10 @@ install(PROGRAMS scripts/Planner_explanation.py
 )
 
 install(PROGRAMS scripts/LiDar_Dection.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS scripts/lstar_obstacle_checker.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -49,6 +49,7 @@ from moveit_msgs.msg import (
     PositionConstraint,
     OrientationConstraint,
     BoundingVolume,
+    JointConstraint,
 )
 from shape_msgs.msg import SolidPrimitive
 
@@ -69,6 +70,22 @@ class ArucoNavigator(Node):
         self.TOOL_LINK = "ur_tool0"
         self.CAMERA_OPTICAL_FRAME = "realsense_color_optical_frame"
         self.MOVE_GROUP = "ur5_manip"
+
+        #YOLO FEEDBACK
+        self.yolo_seen = False
+        self.yolo_label = ""
+        self.yolo_detect_sub = self.create_subscription(
+            Bool, "/yolo/detected", self._on_yolo_detected, 10
+        )
+        self.yolo_label_sub = self.create_subscription(
+            String, "/yolo/label", self._on_yolo_label, 10
+        )
+
+
+
+
+        # Push button to start pushing
+        self.start_push_pub = self.create_publisher(Bool, "/start_push", 10)
 
         # Planning tolerances
         self.ORI_TOL = 0.17  # rad (~10 deg)
@@ -105,6 +122,12 @@ class ArucoNavigator(Node):
         self.setup_nav2()
         self.setup_moveit()
         self.setup_yolo()
+
+        # __init__ ke end ke paas (publishers/subscribers ban chuke hon), yeh teen flags add karo:
+        self.armed = False              # first detection ko allow?
+        self.home_goal_active = False   # home goal already bhej diya?
+        self.push_started = False       # push already trigger ho chuka?
+
 
         self.get_logger().info("Node initialized (Nav2 + MoveIt rotate-in-place)")
 
@@ -157,6 +180,7 @@ class ArucoNavigator(Node):
         self.image_width = int(msg.width)
         self.image_height = int(msg.height)
         self.get_logger().info("Camera calibration received")
+
 
     # ------------------------- HELPERS -------------------------
     def _normalize(self, v: np.ndarray) -> Tuple[np.ndarray, float]:
@@ -351,12 +375,24 @@ class ArucoNavigator(Node):
                 f"  Ori Tol (rad)  : {self.ORI_TOL:.3f}\n"
                 f"  Pos Tol (m)    : {self.POS_TOL:.3f}"
             )
-
+            self._reset_and_arm_yolo()
             self.send_rotate_in_place_goal(target_pose)
             self.sent_goal = True
             self.alignment_active = True
         except Exception as e:
             self.get_logger().error(f"Align computation failed: {e}")
+
+
+    def _reset_and_arm_yolo(self):
+        # next cycle ke liye system ready
+        self.armed = True
+        self.home_goal_active = False
+        self.push_started = False
+        # yolo ko ON karo (ab first detection accept hoga)
+        try:
+            self.yolo_node.set_enabled(True)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to enable YOLO: {e}")
 
     def send_rotate_in_place_goal(self, target_pose_stamped: PoseStamped) -> None:
         if not self.moveit_action_client.wait_for_server(timeout_sec=5.0):
@@ -367,6 +403,8 @@ class ArucoNavigator(Node):
         req = MotionPlanRequest()
         req.group_name = self.MOVE_GROUP
 
+        #One thing to note - to control ee we have to define the PositionConstraint and OrientationConstraint
+        #for the ee link - in our case ur_tool0
         # Orientation constraint (tight)
         oc = OrientationConstraint()
         oc.header = target_pose_stamped.header
@@ -417,6 +455,91 @@ class ArucoNavigator(Node):
 
         future = self.moveit_action_client.send_goal_async(goal_msg)
         future.add_done_callback(self._moveit_goal_response_callback)
+    
+    # def _on_yolo_detected(self, msg: Bool):
+    #     self.yolo_seen = bool(msg.data)
+    #     if self.yolo_seen:
+    #         self.get_logger().info("[YOLO] Detection True → returning manip to home pose")
+    #         try:
+    #             self.yolo_node.set_enabled(False)   # YOLO disable so it won’t trigger again
+    #         except Exception:
+    #             pass
+    #         self._send_return_to_home_goal()
+
+    def _on_yolo_detected(self, msg: Bool):
+        if not msg.data:
+            return
+
+        # 1) guard: sirf first True accept karo
+        if not self.armed or self.home_goal_active:
+            return
+
+        # 2) turant gate band karo (race window chhoti)
+        self.armed = False
+        try:
+            self.yolo_node.set_enabled(False)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to disable YOLO: {e}")
+
+        # 3) ek hi home-goal bhejo
+        if not self.home_goal_active:
+            self.home_goal_active = True
+            self.get_logger().info("[YOLO] Detection True → returning manip to home pose")
+            self._send_return_to_home_goal()
+
+    def _send_return_to_home_goal(self):
+        joint_names = ["ur_shoulder_pan_joint","ur_shoulder_lift_joint",
+                   "ur_elbow_joint","ur_wrist_1_joint","ur_wrist_2_joint","ur_wrist_3_joint"]
+        home_position = [-1.57, -1.57, -1.57, -0.3, 1.57, 0.0]  # radians
+        req = MotionPlanRequest()
+        req.group_name = self.MOVE_GROUP
+        cs = Constraints()
+        #TO control each joints we have to define a JointConstraint for each joint
+        for name, val in zip(joint_names, home_position):
+            jc = JointConstraint()
+            jc.joint_name = name
+            jc.position = float(val)
+            jc.tolerance_above = jc.tolerance_below = 0.03
+            jc.weight = 1.0
+            cs.joint_constraints.append(jc)
+        req.goal_constraints = [cs]
+        goal = MoveGroup.Goal()
+        goal.request = req
+        goal.planning_options = PlanningOptions()
+        goal.planning_options.plan_only = False
+
+        fut = self.moveit_action_client.send_goal_async(goal)
+        fut.add_done_callback(self._home_position_goal_response_cb)
+
+    def _home_position_goal_response_cb(self, fut):
+        gh = fut.result()
+        if not gh or not gh.accepted:
+            self.get_logger().error("Home pose MoveIt goal rejected")
+            return
+        self.get_logger().info("Home pose MoveIt goal accepted")
+        rf = gh.get_result_async()
+        rf.add_done_callback(self._home_position_result_cb)
+
+    def _home_position_result_cb(self, fut):
+        try:
+            res = fut.result().result
+            if res.error_code.val == 1:
+                # success
+                if not self.push_started:
+                    self.push_started = True
+                    self.get_logger().info("Manipulator returned to home ✅ → starting push")
+                    self.start_push_pub.publish(Bool(data=True))
+            else:
+                # failure
+                self.get_logger().error(f"Home return failed: code={res.error_code.val}")
+        except Exception as e:
+            self.get_logger().error(f"Home return result error: {e}")
+
+    
+    def _on_yolo_label(self, msg: String):
+        self.yolo_label = msg.data or ""
+        if self.yolo_label:
+            self.get_logger().info(f"[YOLO] Label detected: {self.yolo_label}")
 
     def _moveit_goal_response_callback(self, future) -> None:
         goal_handle = future.result()
@@ -425,12 +548,27 @@ class ArucoNavigator(Node):
             self.get_logger().error("MoveIt2 goal rejected")
             return
         self.get_logger().info("MoveIt2 goal accepted")
-        try:
-            self.yolo_node.set_enabled(True)
-        except Exception as e:
-            self.get_logger().error(f"Enable YOLO failed: {e}")
+        # try:
+        #     self.yolo_node.set_enabled(True)
+        # except Exception as e:
+        #     self.get_logger().error(f"Enable YOLO failed: {e}")
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self._moveit_result_callback)
+
+    
+
+    # def _moveit_result_callback(self, future) -> None:
+    #     try:
+    #         result = future.result().result
+    #         self.alignment_active = False
+    #         if result.error_code.val == 1:
+    #             self.get_logger().info("Camera aligned to marker (rotation complete)")
+    #             #self._start_zero_vel_hold(duration_sec=2.0, rate_hz=20.0)
+    #         else:
+    #             self.get_logger().error(f"Rotate-in-place failed: error_code={result.error_code.val}")
+    #     except Exception as e:
+    #         self.alignment_active = False
+    #         self.get_logger().error(f"Result callback error: {e}")
 
     def _moveit_result_callback(self, future) -> None:
         try:
@@ -438,12 +576,13 @@ class ArucoNavigator(Node):
             self.alignment_active = False
             if result.error_code.val == 1:
                 self.get_logger().info("Camera aligned to marker (rotation complete)")
-                self._start_zero_vel_hold(duration_sec=2.0, rate_hz=20.0)
             else:
                 self.get_logger().error(f"Rotate-in-place failed: error_code={result.error_code.val}")
+                self.sent_goal = False  # <-- allow a reattempt on next ArUco update
         except Exception as e:
             self.alignment_active = False
             self.get_logger().error(f"Result callback error: {e}")
+            self.sent_goal = False  # <-- also reset here
 
     # -------------------- IMAGE / DETECTION --------------------
     def compressed_image_callback(self, msg: CompressedImage) -> None:

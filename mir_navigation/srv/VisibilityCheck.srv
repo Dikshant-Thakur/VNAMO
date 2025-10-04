@@ -1,0 +1,19 @@
+# Request (LiDar -> lstar)
+float64 center_x       # ROI center (map frame)
+float64 center_y
+float64 length         # ROI length (m)
+float64 width          # ROI width (m)
+float64 yaw            # orientation in radians
+float64 duration_sec   # kitni der tak check chalana hai
+
+
+# --- NEW: box footprint info (map frame) ---
+float32 box_center_x
+float32 box_center_y
+float32 box_length    # box L
+float32 box_width     # box W
+
+
+---
+# Response (lstar -> LiDar)
+bool obstacle_present   # True = blocked, False = clear

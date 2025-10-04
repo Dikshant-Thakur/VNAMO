@@ -49,7 +49,7 @@
   <!-- - 4x caster wheels + rotation link: 4x 1.31 kg -->
   <!-- - 2x act wheels: 2kg -->
   <!--xacro:property name="mir_100_base_mass" value="66.96" /-->
-  <xacro:property name="mir_250_base_mass" value="97.0" />
+  <xacro:property name="mir_250_base_mass" value="200.0" />
 
   <xacro:property name="imu_stdev" value="0.00017" />
 

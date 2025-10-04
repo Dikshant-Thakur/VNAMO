@@ -29,9 +29,6 @@ from std_msgs.msg import ColorRGBA
 import tf2_ros
 from scipy.spatial.transform import Rotation as R
 
-from mir_navigation.srv import VisibilityCheck
-from math import radians
-
 
 # ---------- tiny helpers ----------
 def yaw_from_quat(q: Quaternion) -> float:
@@ -92,15 +89,6 @@ class PushOrchestrator(Node):
         #tf setup
         self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
-        # Service clients
-        self.vis_cli = self.create_client(VisibilityCheck, '/lstar/check_area')
-        for _ in range(30):  # ~3 sec wait
-            if self.vis_cli.wait_for_service(timeout_sec=0.1):
-                self.get_logger().info('[PUSH] VisibilityCheck service ready.')
-                break
-        else:
-            self.get_logger().warn('[PUSH] VisibilityCheck service NOT available.')
 
         # Params
         self.declare_parameter('global_costmap_topic', '/global_costmap/costmap')
@@ -163,44 +151,6 @@ class PushOrchestrator(Node):
         self.dir_order = list(self.get_parameter('dir_order').get_parameter_value().string_array_value or ['+X','-X','+Y','-Y'])
 
         self.get_logger().info("Push orchestrator up. Waiting for costmap + amcl...")
-
-    def check_area_blocked(self, cx, cy, L, W, yaw_deg, dur_sec, timeout_sec):
-        if not self.vis_cli.service_is_ready():
-            self.get_logger().warn('[PUSH] Service not ready.')
-            return None
-
-        req = VisibilityCheck.Request()
-        req.center_x = float(cx)
-        req.center_y = float(cy)
-        req.length   = float(L)
-        req.width    = float(W)
-        req.yaw      = radians(float(yaw_deg))   # if your yaw is degrees
-        req.box_center_x = float(self.box['x'])
-        req.box_center_y = float(self.box['y'])
-        req.box_length   = float(self.box['L'])
-        req.box_width    = float(self.box['W'])
-
-        req.duration_sec = float(dur_sec)
-
-        future = self.vis_cli.call_async(req)
-
-        end = self.get_clock().now().nanoseconds + int(timeout_sec*1e9)
-        while rclpy.ok() and not future.done():
-            rclpy.spin_once(self, timeout_sec=0.05)
-            if self.get_clock().now().nanoseconds > end:
-                self.get_logger().warn('[PUSH] VisibilityCheck timeout.')
-                break
-
-        if not future.done():
-            return None
-
-        try:
-            resp = future.result()
-            return resp.obstacle_present  # True=blocked, False=clear
-        except Exception as ex:
-            self.get_logger().error(f'[PUSH] Service call failed: {ex}')
-            return None
-
 
     # ----- callbacks -----
     def _map_cb(self, msg: OccupancyGrid):
@@ -1168,49 +1118,6 @@ class PushOrchestrator(Node):
             if not ok_view:
                 self.get_logger().warn("[SCOUT] Side-peek both points failed → trying next direction.")
                 continue
-
-            #Visibility Check from camera
-            box_cx = self.box['x']
-            box_cy = self.box['y']
-            K = plan['K']
-
-            d = plan['dir']
-            if d == '+X':   ux, uy, yaw_deg =  1.0,  0.0,   0.0
-            elif d == '-X': ux, uy, yaw_deg = -1.0,  0.0, 180.0
-            elif d == '+Y': ux, uy, yaw_deg =  0.0,  1.0,  90.0
-            else:           ux, uy, yaw_deg =  0.0, -1.0, -90.0  # '-Y'
-
-            # Determine corridor width based on direction
-            anchor_x = box_cx + 0.5 * self.box['L'] * ux #Anchor = box ka wo side centre jo push wali direction me hai.
-            anchor_y = box_cy + 0.5 * self.box['W'] * uy
-            region_cx = anchor_x + 0.5 * K * ux
-            region_cy = anchor_y + 0.5 * K * uy
-
-            if d in ('+X','-X'):
-                corridor_width = max(self.robot_W, self.box['W'])
-            else:
-                corridor_width = max(self.robot_L, self.box['L'])
-
-            blocked = self.check_area_blocked(
-                cx=region_cx, cy=region_cy,
-                L=K, W=corridor_width,
-                yaw_deg=yaw_deg,
-                dur_sec=10,
-                timeout_sec=12   # client wait >= service duration
-            )
-
-            if blocked is None:
-                self.get_logger().warn("[PUSH] VisibilityCheck timeout/failed → treating as BLOCKED.")
-                # safe choice: skip this direction
-                continue
-            if blocked:
-                self.get_logger().info("[PUSH] Path BLOCKED → skipping this direction.")
-                break
-
-            self.get_logger().info("[PUSH] Path CLEAR → proceeding to push sequence.")
-
-
-
             # Return to pre-manip before starting approach
             goal_back = self._build_nav_goal(pre_x, pre_y, pre_yaw)
             gh_back   = self._send_and_wait_accept(goal_back)

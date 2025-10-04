@@ -6,7 +6,7 @@ from typing import Union
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import CompressedImage, Image
 from vision_msgs.msg import (
@@ -21,9 +21,6 @@ import numpy as np
 import cv2
 import torch
 from ultralytics import YOLO
-
-from std_msgs.msg import Bool, String
-import json
 
 
 def _normalize_device_param(device_param: Union[str, int]) -> str:
@@ -56,9 +53,6 @@ def _normalize_device_param(device_param: Union[str, int]) -> str:
 class YoloDetector(Node):
     def __init__(self):
         super().__init__("yolo_detector")
-
-        self.pub_detected   = self.create_publisher(Bool,   "/yolo/detected",   10)
-        self.pub_label = self.create_publisher(String, "/yolo/label", 10)
 
         # ---------------- Parameters ----------------
         self.declare_parameter("model_path", "")
@@ -126,13 +120,9 @@ class YoloDetector(Node):
         # ---------------- Bridge & pubs/subs ----------------
         self.bridge = CvBridge() #ROS Image messages ↔ OpenCV images (numpy array).
         self.pub_det = self.create_publisher(Detection2DArray, detections_topic, 10)
-        #-------Transient local, reliable for overlay image pub-------
-        overlay_qos = QoSProfile(depth=1)
-        overlay_qos.reliability = QoSReliabilityPolicy.RELIABLE
-        overlay_qos.durability  = QoSDurabilityPolicy.TRANSIENT_LOCAL
         self.pub_overlay = None
         if self.pub_img:
-            self.pub_overlay = self.create_publisher(Image, overlay_topic, overlay_qos)
+            self.pub_overlay = self.create_publisher(Image, overlay_topic, 10)
 
         # Camera streams should use sensor-data QoS (best-effort, small queue)
         self.sub = self.create_subscription(
@@ -203,20 +193,6 @@ class YoloDetector(Node):
         boxes = r.boxes  # Boxes object, bbox + attributes. 
         names = r.names if hasattr(r, "names") else None  # check names attribute is in r object or not. 
 
-        if boxes and len(boxes) > 0:
-            # sabse confident detection
-            best_box = max(boxes, key=lambda b: float(b.conf[0]))
-            cls_id = int(best_box.cls[0].item())
-            conf   = float(best_box.conf[0].item())
-            label  = names[cls_id] if names else str(cls_id)
-
-            # publish feedback
-            self.pub_detected.publish(Bool(data=True))
-            self.pub_label.publish(String(data=label))
-        else:
-            self.pub_detected.publish(Bool(data=False))
-
-
         det_arr = Detection2DArray() #information type/container for 2D multi-detections (could be one detection or multiple.)
         det_arr.header = header
 
@@ -235,21 +211,18 @@ class YoloDetector(Node):
                     score = float(conf[i].item()) if conf is not None else 0.0 #.item() - from tensor single to normal single value.
                     cls_id = int(cls[i].item()) if cls is not None else 0
                     label = None
-                    if isinstance(names, dict): #Checking names is of dictionary type, YOLOv8 trained on COCO dataset, so names is dict.
+                    if isinstance(names, dict): #YOLOv8 trained on COCO dataset, so names is dict.
                         label = names.get(cls_id, str(cls_id))
                     elif isinstance(names, list) and 0 <= cls_id < len(names): #Custom trained model, so names is list.
                         label = names[cls_id]
                     else:
                         label = str(cls_id)
 
-                    # ---- vision_msgs Detection2D(ROS message type) ----
-                    #Detection2D = "Frame X me ek object mila hai, is jagah (bbox) pe."
-                    det = Detection2D() #for single detection
+                    # ---- vision_msgs Detection2D ----
+                    det = Detection2D() #for single detection.
                     det.header = header
 
-                    #ObjectHypothesisWithPose = "Mujhe lagta hai ye box ek person hai 0.91 confidence ke saath."
-                    hyp = ObjectHypothesisWithPose() #for single hypothesis (guess)
-
+                    hyp = ObjectHypothesisWithPose()
                     # Put the human-readable label in class_id; downstream can map as needed
                     hyp.hypothesis.class_id = label
                     hyp.hypothesis.score = score
