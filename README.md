@@ -4,6 +4,9 @@ This is a ROS2 package for MiR 250 with ros2_control, Gazebo and Ignition Gazebo
 ![alt text](gazebo.png)
 ![alt text](navigation.png)
 
+## Video - Glimpse of Computer Vision + Navigation of Mir + Ur5e.
+https://github.com/user-attachments/assets/84e8e1ee-dfe1-44b1-96c8-f438b1279440
+
 
 # Installation
 
