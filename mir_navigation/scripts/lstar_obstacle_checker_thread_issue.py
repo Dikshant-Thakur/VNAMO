@@ -129,12 +129,13 @@ class LStarObstacleChecker(Node):
         # ---- Parameters (tweak if needed) ----
         self.declare_parameter('cloud_topic', '/realsense/depth/color/points')
         self.declare_parameter('target_frame', 'map')
-        self.declare_parameter('grid_nx', 20)           # visibility grid X cells
-        self.declare_parameter('grid_ny', 10)           # visibility grid Y cells
+        # self.declare_parameter('grid_nx', 20)           # visibility grid X cells
+        # self.declare_parameter('grid_ny', 10)           # visibility grid Y cells
+        self.declare_parameter('grid_cell_m', 0.10)  # each cell ~10 cm (tune as you like)
         self.declare_parameter('vis_ok_thresh', 0.70)   # >= => OK
         self.declare_parameter('vis_min_thresh', 0.20)  # < => NONE
-        self.declare_parameter('min_obst_pts', 5)       # >= => obstacle
-        self.declare_parameter('z_free_max', 0.35)      # <= => free band upper (m, absolute z in map)
+        self.declare_parameter('min_obst_pts', 500)       # >= => obstacle
+        self.declare_parameter('z_free_max', 0.15)      # <= => free band upper (m, absolute z in map)
         self.declare_parameter('z_max_clip', 2.50)      # ignore points above this (m)
         self.declare_parameter('stale_cloud_sec', 1.0)  # no cloud newer than this => FAILURE
         self.declare_parameter('max_points_process', 120000)  # limit for speed
@@ -142,8 +143,8 @@ class LStarObstacleChecker(Node):
 
         self.cloud_topic   = self.get_parameter('cloud_topic').get_parameter_value().string_value
         self.target_frame  = self.get_parameter('target_frame').get_parameter_value().string_value
-        self.grid_nx       = int(self.get_parameter('grid_nx').value)
-        self.grid_ny       = int(self.get_parameter('grid_ny').value)
+        # self.grid_nx       = int(self.get_parameter('grid_nx').value)
+        # self.grid_ny       = int(self.get_parameter('grid_ny').value)
         self.vis_ok_thresh = float(self.get_parameter('vis_ok_thresh').value)
         self.vis_min_thresh= float(self.get_parameter('vis_min_thresh').value)
         self.min_obst_pts  = int(self.get_parameter('min_obst_pts').value)
@@ -152,6 +153,8 @@ class LStarObstacleChecker(Node):
         self.stale_cloud_s = float(self.get_parameter('stale_cloud_sec').value)
         self.max_points    = int(self.get_parameter('max_points_process').value)
         self.marker_ns     = self.get_parameter('marker_ns').get_parameter_value().string_value
+        self.grid_cell_m = float(self.get_parameter('grid_cell_m').value)
+
 
         # ---- Subscribers / Publishers ----
         self._last_cloud_msg: Optional[PointCloud2] = None
@@ -588,6 +591,8 @@ class LStarObstacleChecker(Node):
         W  = float(req.width)
         yaw= float(req.yaw)
         dur= float(req.duration_sec)
+        self._box_fp = (req.box_center_x, req.box_center_y, req.box_length, req.box_width)
+
 
         self.get_logger().info(f"[CHECK] Request: center=({cx:.2f},{cy:.2f}) L={L:.2f} W={W:.2f} yaw={math.degrees(yaw):.1f}° dur={dur:.1f}s")
 
@@ -621,7 +626,9 @@ class LStarObstacleChecker(Node):
                     z_target = self.view_z_fixed
                     self.get_logger().warn(f"[VIEW] Camera TF failed; falling back to fixed z={z_target:.3f}m.")
 
-            target = np.array([cx_pf, cy_pf, z_target == 0.0], dtype=float)
+            # target = np.array([cx_pf, cy_pf, z_target], dtype=float)
+            target = np.array([cx_pf, cy_pf, 0.0], dtype=float)
+
 
             # 3) Sirf orientation wala EE pose banao (xyz same, sirf q change)
             ee_pose = self._ee_pose_orient_only(target, self.planning_frame)
@@ -643,54 +650,58 @@ class LStarObstacleChecker(Node):
             resp.obstacle_present = True
             return resp
 
-        # === Visibility evaluation loop (unchanged) ===
+        # === Iterative Visibility Evaluation Loop ===
         t0 = self.get_clock().now().nanoseconds
         end_ns = t0 + int(dur * 1e9)
-
-        blocked_final = True  # safe default unless proven clear
+        blocked_final = True
         failure_flag = False
+        coverage_grid = None  # accumulated visibility grid
 
+        step = 0
         while rclpy.ok() and self.get_clock().now().nanoseconds < end_ns:
-            # publish marker (yellow translucent)
-            self._publish_roi_marker(cx, cy, L, W, yaw, color=(0.9, 0.8, 0.1, 0.35))
-
-            # Pull cloud in map
+            step += 1
             Pm = self._get_cloud_in_map()
             if Pm is None:
                 failure_flag = True
                 self.get_logger().warn("[FAILURE] No usable pointcloud (stale or TF error).")
-                time.sleep(0.05)
-                rclpy.spin_once(self, timeout_sec=0.5)
+                time.sleep(0.2)
                 continue
 
-            roi_pts, observed_cells, vis, obst_pts = self._eval_roi(Pm, cx, cy, L, W, yaw)
+            roi_pts, observed_cells, vis, obst_pts, (xp, yp, inside, grid) = self._eval_roi(Pm, cx, cy, L, W, yaw)
 
-            if roi_pts == 0:
-                blocked = True
-                self.get_logger().warn(f"[VIS NONE] vis={vis*100:.0f}% | ROI pts=0 | blocked={blocked}")
-            else:
-                if obst_pts >= self.min_obst_pts:
-                    blocked = True
-                    self.get_logger().warn(f"[VIS OK] vis={vis*100:.0f}% | ROI pts={roi_pts} | obst_pts={obst_pts} | blocked={blocked}")
-                elif vis < self.vis_min_thresh:
-                    blocked = True
-                    self.get_logger().warn(f"[VIS PARTIAL] vis={vis*100:.0f}% | ROI pts={roi_pts} | Suggest small rotate/step | blocked={blocked}")
-                elif vis >= self.vis_ok_thresh:
-                    blocked = False
-                    self.get_logger().info(f"[VIS OK] vis={vis*100:.0f}% | ROI pts={roi_pts} | blocked={blocked}")
-                else:
-                    blocked = True
-                    self.get_logger().warn(f"[VIS PARTIAL] vis={vis*100:.0f}% | ROI pts={roi_pts} | blocked={blocked}")
+            # merge new grid with previous coverage
+            coverage_grid = self._merge_coverages(coverage_grid, grid)
+            vis_now = float(coverage_grid.sum()) / float(coverage_grid.size)
+            self.get_logger().info(f"[ITER] Step {step}: ROI coverage={vis_now*100:.1f}% | pts={roi_pts}")
 
-            blocked_final = blocked
-
-            if not blocked_final and vis >= self.vis_ok_thresh:
+            # if coverage good enough, stop
+            if vis_now >= 0.90:
+                self.get_logger().info("[ITER] ROI visibility sufficient ✅")
+                blocked_final = False
                 break
 
-            time.sleep(0.05)
-            rclpy.spin_once(self, timeout_sec=0.5)
+            # compute uncovered centroid in ROI frame
+            lx, ly = self._compute_uncovered_centroid(coverage_grid, L, W)
+            cx_new, cy_new = self._roi_local_to_world(cx, cy, yaw, lx, ly)
+            self.get_logger().info(f"[ITER] Moving camera to uncovered centroid ({cx_new:.2f}, {cy_new:.2f})")
 
-        # Final decision & final marker
+            # orient camera toward new centroid
+            try:
+                ee_pose = self._ee_pose_orient_only(np.array([cx_new, cy_new, 0.0]), self.planning_frame)
+                if ee_pose is not None:
+                    self._plan_execute_orient_only(ee_pose, pos_tol=0.02)
+                    time.sleep(0.6)
+                else:
+                    self.get_logger().warn("[ITER] Could not build new EE pose; skipping move.")
+            except Exception as ex:
+                self.get_logger().warn(f"[ITER] Reorient failed: {ex}")
+                time.sleep(0.5)
+                continue
+
+            # continue until duration expires or enough coverage
+            time.sleep(0.5)
+
+        # Final marker color
         color = (0.1, 0.8, 0.2, 0.35) if not blocked_final else (0.9, 0.1, 0.1, 0.35)
         self._publish_roi_marker(cx, cy, L, W, yaw, color=color)
 
@@ -700,6 +711,7 @@ class LStarObstacleChecker(Node):
         resp.obstacle_present = bool(blocked_final)
         self.get_logger().info(f"[RESULT] obstacle_present={resp.obstacle_present}")
         return resp
+
 
 
 
@@ -790,32 +802,61 @@ class LStarObstacleChecker(Node):
     # ------------------- Helper: publish ROI marker -------------------
 
     def _publish_roi_marker(self, cx, cy, L, W, yaw_rad, color=(0.9, 0.8, 0.1, 0.35)):
+        from visualization_msgs.msg import Marker
+        from geometry_msgs.msg import Pose
+
         m = Marker()
-        m.header = Header()
-        m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = self.target_frame
+        m.header.stamp = self.get_clock().now().to_msg()
         m.ns = self.marker_ns
         m.id = 1
         m.type = Marker.CUBE
         m.action = Marker.ADD
-        m.pose.position.x = float(cx)
-        m.pose.position.y = float(cy)
-        m.pose.position.z = 0.0
 
-        # yaw around Z
-        cyaw = math.cos(yaw_rad * 0.5)
-        syaw = math.sin(yaw_rad * 0.5)
-        m.pose.orientation.x = 0.0
-        m.pose.orientation.y = 0.0
-        m.pose.orientation.z = syaw
-        m.pose.orientation.w = cyaw
+        # ROI pose in map
+        pose = Pose()
+        pose.position.x = float(cx)
+        pose.position.y = float(cy)
+        pose.position.z = 0.025  # thin slab, 5 cm above ground
+        # yaw -> quaternion (z-rotation only)
+        cyaw, syaw = math.cos(yaw_rad * 0.5), math.sin(yaw_rad * 0.5)
+        pose.orientation.z = syaw
+        pose.orientation.w = cyaw
 
-        # thin prism for 2D ROI
+        m.pose = pose
         m.scale.x = float(L)
         m.scale.y = float(W)
-        m.scale.z = 0.05
+        m.scale.z = 0.05  # 5 cm thick
+
         m.color.r, m.color.g, m.color.b, m.color.a = color
-        m.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()  # refresh during window
+        self.marker_pub.publish(m)
+
+
+    def _publish_obstacle_points(self, P_map, inside, z_thresh, color=(1.0, 0.0, 0.0, 1.0), max_points=5000):
+        from visualization_msgs.msg import Marker
+        from geometry_msgs.msg import Point
+        import numpy as np
+
+        # Mask: ROI ke andar + z > threshold
+        obst_mask = inside & (P_map[:, 2] > float(z_thresh))
+        pts = P_map[obst_mask]
+
+        if pts.shape[0] > max_points:
+            idx = np.random.choice(pts.shape[0], max_points, replace=False)
+            pts = pts[idx]
+
+        m = Marker()
+        m.header.frame_id = self.target_frame
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = self.marker_ns
+        m.id = 3                   # <- alag ID for obstacles
+        m.type = Marker.POINTS
+        m.action = Marker.ADD
+        m.scale.x = 0.025
+        m.scale.y = 0.025
+        m.color.r, m.color.g, m.color.b, m.color.a = color
+
+        m.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in pts]
         self.marker_pub.publish(m)
 
     # ------------------- Helper: pull latest cloud in /map -------------------
@@ -872,54 +913,180 @@ class LStarObstacleChecker(Node):
 
         return Pm
 
+
+    def _publish_inside_points(self, P_map, inside, color=(0.1, 0.6, 1.0, 0.9), max_points=5000):
+        from visualization_msgs.msg import Marker
+        from geometry_msgs.msg import Point
+        import numpy as np
+
+        # ROI ke andar ke saare points
+        pts = P_map[inside]
+
+        # --- subsample BEFORE building Marker.points ---
+        if pts.shape[0] > max_points:
+            idx = np.random.choice(pts.shape[0], max_points, replace=False)
+            pts = pts[idx]
+
+        m = Marker()
+        m.header.frame_id = self.target_frame
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = self.marker_ns
+        m.id = 2                     # ROI cube (id=1) se different
+        m.type = Marker.POINTS
+        m.action = Marker.ADD
+        m.scale.x = 0.02             # point size (m)
+        m.scale.y = 0.02
+        m.color.r, m.color.g, m.color.b, m.color.a = color
+
+        # build points
+        m.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in pts]
+
+        # (optional) lifetime set karna ho to:
+        # m.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
+
+        self.marker_pub.publish(m)
+
+        # Agar zero points: publish empty karna hi enough hota hai; warna:
+        # if pts.shape[0] == 0:
+        #     m.action = Marker.DELETE
+        #     self.marker_pub.publish(m)
+
+
+
     # ------------------- Core evaluator -------------------
 
-    def _eval_roi(self, P_map: np.ndarray, cx, cy, L, W, yaw_rad) -> Tuple[int, int, float, int]:
+    def _eval_roi(self, P_map, cx, cy, L, W, yaw_rad):
         """
-        Returns:
-          roi_points_count, observed_cells, vis_ratio, obstacle_points
+        Returns (roi_pts, observed_cells, vis_ratio, obst_pts)
+
+        Changes vs before:
+        - Forward-only strip: x' ∈ [eps_forward, L], |y'| ≤ W/2
+        - EXCLUDE points inside the box footprint (axis-aligned) with small margin
+        - Obstacle = z > self.z_free_max (unchanged)
         """
-        if P_map.size == 0:
+        import numpy as np
+        from visualization_msgs.msg import Marker
+        from geometry_msgs.msg import Point
+
+        # ---- Tunables (simple) ----
+        fp_margin   = 0.15    # 15 cm: dilate footprint to absorb sensor edge/noise
+        # grid_nx, grid_ny = 20, 10   # for visibility metric (same spirit as before)
+        cell = max(1e-3, float(self.grid_cell_m))  # safety
+        grid_nx = max(1, int(math.ceil(float(L) / cell)))
+        grid_ny = max(1, int(math.ceil(float(W) / cell)))
+
+        # ---- Early outs ----
+        if P_map is None or P_map.shape[0] == 0:
+            self.get_logger().warn("[FAILURE] No valid points found in transformed cloud.")
             return 0, 0, 0.0, 0
 
-        # Shift to center and rotate by -yaw to align ROI with axes
-        c = np.array([cx, cy, 0.0], dtype=np.float32)
-        P = P_map - c  # translate
+        # ---- 0) Draw ROI marker (your existing helper) ----
+        try:
+            self._publish_roi_marker(cx, cy, L, W, yaw_rad, color=(0.9, 0.8, 0.1, 0.35))
+        except Exception:
+            pass
 
-        cyaw, syaw = math.cos(-yaw_rad), math.sin(-yaw_rad)
-        Rz = np.array([[cyaw, -syaw, 0.0],
-                       [syaw,  cyaw, 0.0],
-                       [0.0,   0.0,  1.0]], dtype=np.float32)
-        Pl = (P @ Rz.T)  # local ROI frame
+        # ---- 1) Transform points to ROI local frame (de-rotate by yaw) ----
+        dx = P_map[:, 0] - float(cx) #Depth point offset from center of ROI centre (x cordinate)
+        dy = P_map[:, 1] - float(cy) #Depth point offset from center of ROI centre (y cordinate)
+        c = np.cos(-yaw_rad); s = np.sin(-yaw_rad)   # align ROI with axes, rotation matrix elements
+        # 2D rotation matrix kyunki z axis pe rotation hai
+        xp =  c * dx - s * dy                        # push-axis coord
+        yp =  s * dx + c * dy                        # cross-axis coord
 
-        # In-rectangle mask
-        hx, hy = L * 0.5, W * 0.5
-        inside = (np.abs(Pl[:, 0]) <= hx) & (np.abs(Pl[:, 1]) <= hy)
-        Pl_in = Pl[inside]
-        if Pl_in.size == 0:
-            return 0, 0, 0.0, 0
+        # ---- 2) Forward-only ROI (NOT symmetric) ----
+        halfL = 0.5 * float(L) #L - ROI length
+        halfW = 0.5 * float(W) #W - ROI width
+        inside_roi = (np.abs(xp) < halfL) & (np.abs(yp) < halfW)
 
-        # ROI points count
-        roi_pts = Pl_in.shape[0]
 
-        # Visibility grid (observed cells)
-        nx, ny = self.grid_nx, self.grid_ny
-        # Map local x,y in [-hx,hx]x[-hy,hy] -> indices [0..nx-1], [0..ny-1]
-        ix = np.floor((Pl_in[:, 0] + hx) / (L / max(1, nx)) ).astype(np.int32)
-        iy = np.floor((Pl_in[:, 1] + hy) / (W / max(1, ny)) ).astype(np.int32)
-        ix = np.clip(ix, 0, max(0, nx-1))
-        iy = np.clip(iy, 0, max(0, ny-1))
-        observed = set((int(x), int(y)) for x, y in zip(ix, iy))
-        observed_cells = len(observed)
-        expected_total = max(1, nx * ny)
-        vis = observed_cells / expected_total
+        # ---- 3) Box footprint EXCLUSION (axis-aligned, map frame) ----
+        # NOTE: service callback must set self._box_fp = (cx, cy, L, W) before calling _eval_roi
+        try:
+            box_cx, box_cy, box_L, box_W = self._box_fp
+            self.get_logger().info(f"[FOOTPRINT] Excluding box footprint at ({box_cx:.2f},{box_cy:.2f}) L={box_L:.2f} W={box_W:.2f}")
+        except Exception:
+            # fallback: no exclusion if not provided
+            self.get_logger().warn("Box footprint not provided")
+            box_cx = box_cy = 0.0; box_L = box_W = 0.0
 
-        # Obstacle points: points with height above free band
-        # (use absolute Z in map frame threshold z_free_max)
-        # We have local Pl_in z equal to P_map z (rotation about Z)
-        obst_pts = np.count_nonzero(P_map[inside, 2] > self.z_free_max)
+        hx = 0.5 * float(box_L) + fp_margin
+        hy = 0.5 * float(box_W) + fp_margin
+        inside_fp = (np.abs(P_map[:,0] - box_cx) <= hx) & (np.abs(P_map[:,1] - box_cy) <= hy)
 
-        return roi_pts, observed_cells, vis, obst_pts
+
+        # inside = inside_roi & (~inside_fp)
+        overlap = np.logical_and(inside_roi, inside_fp)
+        inside = inside_roi & (~overlap)
+
+
+        # ---- 4) Publish ROI-inside points (blue) if your helper exists ----
+        try:
+            self._publish_inside_points(P_map, inside, color=(0.0, 0.5, 1.0, 0.9), max_points=5000)
+        except Exception:
+            # minimal inline publisher (optional): ignore if you already have helper
+            pass
+
+
+        # # ---- 5) Obstacle points = z > z_free_max (same threshold) ----
+        obst_mask = inside & (P_map[:, 2] > float(self.z_free_max))
+        obst_pts  = int(np.count_nonzero(obst_mask))
+
+        # red debug publish if your helper exists
+        try:
+            self._publish_obstacle_points(P_map, inside, self.z_free_max, color=(1.0, 0.0, 0.0, 1.0), max_points=5000)
+        except Exception:
+            pass
+
+        # ---- 6) Visibility metric (grid coverage) ----
+        roi_pts = int(np.count_nonzero(inside)) #how many points are inside the ROI
+
+        observed_cells = 0
+        vis_ratio = 0.0
+        try:
+            # Use only points we kept (inside)
+            X = xp[inside]; Y = yp[inside]
+            if X.size > 0:
+                # shift & scale to 0..1, then to bins
+                bx = np.clip(((X + halfL) / float(L)) * grid_nx, 0, grid_nx - 1).astype(int)
+                by = np.clip(((Y + halfW) / (2.0 * halfW)) * grid_ny, 0, grid_ny - 1).astype(int)
+
+                grid = np.zeros((grid_nx, grid_ny), dtype=bool)
+                grid[bx, by] = True
+                observed_cells = int(grid.sum())
+                vis_ratio = float(observed_cells) / float(grid_nx * grid_ny)
+        except Exception:
+            observed_cells = 0
+            vis_ratio = 0.0
+
+        # return roi_pts, observed_cells, vis_ratio, obst_pts
+        return roi_pts, observed_cells, vis_ratio, obst_pts, (xp, yp, inside, grid)
+
+    
+    def _roi_local_to_world(self, cx, cy, yaw, lx, ly):
+        """ROI ke local frame (lx, ly) point ko world (map) frame me convert kare."""
+        xw = cx + lx * math.cos(yaw) - ly * math.sin(yaw)
+        yw = cy + lx * math.sin(yaw) + ly * math.cos(yaw)
+        return (xw, yw)
+
+    def _compute_uncovered_centroid(self, grid, L, W):
+        """Jo grid cells abhi tak covered nahi hue unka centroid nikalta hai (ROI frame me)."""
+        import numpy as np
+        nx, ny = grid.shape
+        uncovered = np.argwhere(~grid)  # False cells (unseen)
+        if uncovered.size == 0:
+            return (0.0, 0.0)
+        cx = ((uncovered[:, 0] / nx) - 0.5) * L
+        cy = ((uncovered[:, 1] / ny) - 0.5) * W
+        return (float(np.mean(cx)), float(np.mean(cy)))
+
+    def _merge_coverages(self, prev_grid, new_grid):
+        """Purane aur naye grid ko combine karta hai (logical OR)."""
+        if prev_grid is None:
+            return new_grid.copy()
+        return np.logical_or(prev_grid, new_grid)
+
+
 
 
 def main():

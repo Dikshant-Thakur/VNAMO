@@ -1195,8 +1195,8 @@ class PushOrchestrator(Node):
                 cx=region_cx, cy=region_cy,
                 L=K, W=corridor_width,
                 yaw_deg=yaw_deg,
-                dur_sec=10,
-                timeout_sec=12   # client wait >= service duration
+                dur_sec=120,
+                timeout_sec=120   # client wait >= service duration
             )
 
             if blocked is None:
