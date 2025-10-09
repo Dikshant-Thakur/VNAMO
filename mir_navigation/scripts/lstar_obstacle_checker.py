@@ -790,47 +790,68 @@ class LStarObstacleChecker(Node):
             # in-place OR is fine too: self._cov_grid |= grid_frame
             self._cov_grid = np.logical_or(self._cov_grid, grid_frame)
 
-        # 6) Cumulative coverage
-        total_cells = int(self._cov_grid.size)
-        observed_cells_cum = int(self._cov_grid.sum())
-        coverage_sim = observed_cells_cum / float(total_cells)
-        self.get_logger().info(
-            f"[COV] cum={coverage_sim*100:.1f}% ({observed_cells_cum}/{total_cells})"
-        )
-
-        # 7) Uncovered-centre target in /map
         nx, ny = self._cov_grid.shape  
         dx = float(L) / nx
         dy = float(W) / ny
         xc = (np.arange(nx) + 0.5) * dx - 0.5 * float(L)   # ROI-local x centers
         yc = (np.arange(ny) + 0.5) * dy - 0.5 * float(W)   # ROI-local y centers
         Xc, Yc = np.meshgrid(xc, yc, indexing="ij")  # Xc,Yc: (nx,ny)
-        uncovered = ~self._cov_grid
-        if uncovered.any(): # Returns True if ANY element is True
-            # indices of uncovered cells
-            # iy, ix = np.where(uncovered)  # iy: row over yp (y axis), ix: col over xp (x axis)
+        # --- ADD: footprint ko ROI-local me laa kar valid_mask banao ---
+        valid_mask = np.ones_like(self._cov_grid, dtype=bool)
+        try:
+            # Footprint info service se set hoti hai: self._box_fp = (box_cx_map, box_cy_map, box_L, box_W)
+            box_cx_map, box_cy_map, box_L, box_W = self._box_fp
 
-            # # centroid in ROI-local coordinates using precomputed cell centres
-            # # (xp is shape [nx], yp is shape [ny])
-            # lx = float(np.mean(xp[ix]))
-            # ly = float(np.mean(yp[iy]))
+            # Map -> ROI-local (center shift + -yaw rotation)
+            dx_b, dy_b = (box_cx_map - cx), (box_cy_map - cy)
+            c_y, s_y = math.cos(-yaw_rad), math.sin(-yaw_rad)
+            bx = c_y * dx_b - s_y * dy_b   # footprint center in ROI-local (x)
+            by = s_y * dx_b + c_y * dy_b   # footprint center in ROI-local (y)
 
-            # map it to /map using ROI origin (cx, cy) and yaw
-            if uncovered.any():
-                lx = float(Xc[uncovered].mean())
-                ly = float(Yc[uncovered].mean())
-                next_xy_map = self._roi_local_to_world(cx, cy, yaw_rad, lx, ly)
-                next_xy_map = np.asarray(next_xy_map[:2], dtype=float)
-                self.get_logger().info(
-                    f"[UNCOVERED_CENTER] New uncovered region center: MAP({next_xy_map[0]:.3f}, {next_xy_map[1]:.3f}) | ROI_LOCAL({lx:.3f}, {ly:.3f})"
-                )
-            else:
-                self.get_logger().warn("[COV] uncovered.any() True but no cells found in mask?")
-                next_xy_map = None
-            # next_xy_map = self._roi_local_to_world(cx, cy, yaw_rad, lx, ly)  # -> np.array([x_map, y_map])
-            # next_xy_map = np.asarray(next_xy_map[:2], dtype=float)
+            # Footprint rectangle mask (chhota margin optional)
+            mx = 0.5 * float(box_L) + 1e-3
+            my = 0.5 * float(box_W) + 1e-3
+            fp_mask = (np.abs(Xc - bx) <= mx) & (np.abs(Yc - by) <= my)
+
+            valid_mask &= ~fp_mask
+        except Exception:
+            # agar footprint info nahi mili to sab valid hi rehne do
+            self.get_logger().info("[COV] No footprint info; skipping valid_mask")
+            pass
+
+        # 6) Cumulative coverage
+        # total_cells = int(self._cov_grid.size)
+        # observed_cells_cum = int(self._cov_grid.sum())
+        # coverage_sim = observed_cells_cum / float(total_cells)
+        # self.get_logger().info(
+        #     f"[COV] cum={coverage_sim*100:.1f}% ({observed_cells_cum}/{total_cells})"
+        # )
+
+        cov_grid_valid = self._cov_grid.copy()
+        cov_grid_valid[~valid_mask] = False
+        valid_total = int(valid_mask.sum())
+        if valid_total > 0:
+            observed_cells_cum = int(cov_grid_valid.sum())
+            coverage_sim = observed_cells_cum / float(valid_total)
+            self.get_logger().info(f"[COV_VALID] cum={coverage_sim*100:.1f}% ({observed_cells_cum}/{valid_total})")
         else:
-            self.get_logger().info("[COV] Full coverage achieved")
+            self.get_logger().warn("[COV] valid_total=0; check ROI/footprint.")
+            coverage_sim = 0.0
+
+        # 7) Uncovered-centre target in /map
+
+
+        uncovered_valid = valid_mask & (~self._cov_grid)
+        if uncovered_valid.any():
+            lx = float(Xc[uncovered_valid].mean())
+            ly = float(Yc[uncovered_valid].mean())
+            next_xy_map = self._roi_local_to_world(cx, cy, yaw_rad, lx, ly)
+            next_xy_map = np.asarray(next_xy_map[:2], dtype=float)
+            self.get_logger().info(
+                f"[UNCOVERED_CENTER] New uncovered region center: MAP({next_xy_map[0]:.3f}, {next_xy_map[1]:.3f}) | ROI_LOCAL({lx:.3f}, {ly:.3f}) [valid]"
+            )
+        else:
+            self.get_logger().info("[COV] Full (valid) coverage achieved")
             next_xy_map = None  # everything already covered
 
         return float(coverage_sim), next_xy_map
