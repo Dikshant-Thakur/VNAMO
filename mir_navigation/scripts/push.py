@@ -184,10 +184,12 @@ class PushOrchestrator(Node):
 
         future = self.vis_cli.call_async(req)
 
-        end = self.get_clock().now().nanoseconds + int(timeout_sec*1e9)
+        # end = self.get_clock().now().nanoseconds + int(timeout_sec*1e9)
+        end_ns = time.monotonic_ns() + int(timeout_sec * 1e9)
+
         while rclpy.ok() and not future.done():
             rclpy.spin_once(self, timeout_sec=0.05)
-            if self.get_clock().now().nanoseconds > end:
+            if time.monotonic_ns() > end_ns:
                 self.get_logger().warn('[PUSH] VisibilityCheck timeout.')
                 break
 

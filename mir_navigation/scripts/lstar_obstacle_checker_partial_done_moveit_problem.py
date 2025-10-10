@@ -4,8 +4,6 @@
 import math
 import time
 from typing import Optional
-from threading import Event, Lock
-import traceback
 
 import numpy as np
 
@@ -14,13 +12,15 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.clock import Clock, ClockType
 from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
     QoSHistoryPolicy,
     QoSDurabilityPolicy,
 )
+from threading import Event, Lock
+from rclpy.clock import Clock, ClockType
+import traceback
 
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
@@ -127,6 +127,7 @@ class LStarObstacleChecker(Node):
         self._job_cancel = False
         self._job_state = "IDLE"
         self._job_req = None
+        self._job_deadline_ns = 0
         self._last_result_blocked: bool = True
 
         self._tick_count = 0
@@ -134,8 +135,17 @@ class LStarObstacleChecker(Node):
         self._cloud_rx_count = 0
         self._last_age_log_ns = 0
 
-        # Reentrant group for service, timer, action
         self.cbgroup = ReentrantCallbackGroup()
+
+        # Signal to unblock service after job finishes (success/failure/timeout)
+        self._job_done_evt: Event = Event()
+
+        # Steady (wall/monotonic) clock for timers & deadlines
+        self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
+
+        # Protect MoveIt futures from concurrent timer calls
+        self._move_lock = Lock()
+        self._move_goal_active = False
 
         # === Params ===
         self.camera_hfov_deg = float(self.declare_parameter("camera_hfov_deg", 60.0).value)
@@ -206,24 +216,17 @@ class LStarObstacleChecker(Node):
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # ===== Availability/stability primitives =====
-        # Steady (monotonic) clock for timer & deadlines (sim-time independent)
-        self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
-        # Signal to unblock service after job finishes (success/failure/timeout)
-        self._job_done_evt: Event = Event()
-        # Protect MoveIt futures from concurrent timer calls
-        self._move_lock = Lock()
-        self._move_goal_active = False
-
         # Service
         self.srv = self.create_service(
             VisibilityCheck, "/lstar/check_area", self._on_check_area, callback_group=self.cbgroup
         )
 
-        # Cooperative tick (same reentrant group + STEADY clock)
-        self._tick = self.create_timer(
-            0.05, self._process_job_tick, callback_group=self.cbgroup, clock=self._steady_clock
-        )
+        # Cooperative tick
+        self._tick = self.create_timer(0.05, self._process_job_tick)
+
+        # Use STEADY clock + same reentrant group to avoid starvation on reruns
+        self._tick = self.create_timer(0.05, self._process_job_tick, callback_group=self.cbgroup, clock=self._steady_clock)
+
 
         self.get_logger().info(f"[SYS] lstar_obstacle_checker up | cloud={self.cloud_topic} | frame={self.target_frame}")
 
@@ -245,7 +248,7 @@ class LStarObstacleChecker(Node):
 
     def _transform_point_xy(self, x, y, from_frame: str, to_frame: str):
         try:
-            tf = self.tf_buffer.lookup_transform(to_frame, from_frame, rclpy.time.Time(), timeout=Duration(seconds=0.75))
+            tf = self.tf_buffer.lookup_transform(to_frame, from_frame, rclpy.time.Time(), timeout=Duration(seconds=0.5))
             T = tf_to_matrix(tf)
             p = np.array([float(x), float(y), 0.0, 1.0], dtype=np.float32)
             pout = T @ p
@@ -256,6 +259,7 @@ class LStarObstacleChecker(Node):
 
     # ---------- MoveIt: orientation-only helpers ----------
     def _ee_pose_orient_only(self, target_w: np.ndarray, planning_frame: str) -> Optional[PoseStamped]:
+        # Ensure transforms
         if not self._ensure_cam_ee_tf():
             self.get_logger().error("[VIEW] Missing cam<->ee TF")
             return None
@@ -263,7 +267,7 @@ class LStarObstacleChecker(Node):
         # Current camera or EE position in planning frame
         try:
             tf_cam_now = self.tf_buffer.lookup_transform(
-                planning_frame, self.CAMERA_OPTICAL_FRAME, rclpy.time.Time(), timeout=Duration(seconds=0.75)
+                planning_frame, self.CAMERA_OPTICAL_FRAME, rclpy.time.Time(), timeout=Duration(seconds=0.5)
             )
             cam_pos_now = np.array(
                 [
@@ -275,7 +279,7 @@ class LStarObstacleChecker(Node):
             )
         except Exception:
             tf_ee_now = self.tf_buffer.lookup_transform(
-                planning_frame, self.ee_link, rclpy.time.Time(), timeout=Duration(seconds=0.75)
+                planning_frame, self.ee_link, rclpy.time.Time(), timeout=Duration(seconds=0.5)
             )
             cam_pos_now = np.array(
                 [
@@ -390,29 +394,25 @@ class LStarObstacleChecker(Node):
         self.get_logger().info(f"[VIEW] scheduling next look-at xy=({float(xy[0]):.2f}, {float(xy[1]):.2f})")
         goal = self._build_orient_only_goal_to(xy)
         with self._move_lock:
-            self._move_future = self.movegroup_ac.send_goal_async(goal)
-            self._result_future = None
-            self._move_goal_active = True
+            self._move_future = self.movegroup_ac.send_goal_async(goal); self._result_future = None; self._move_goal_active = True
         return True
 
     def _moveit_motion_done(self) -> bool:
-        # Thread-safe, idempotent goal lifecycle
         with self._move_lock:
-            if not self._move_goal_active:
+            # if no active goal, nothing to do
+            if not getattr(self, "_move_goal_active", False):
                 return False
-
             mf = getattr(self, "_move_future", None)
             rf = getattr(self, "_result_future", None)
-
             # waiting for goal acceptance
             if mf is not None and not mf.done():
                 return False
-
             # got goal_handle, request result if not yet requested
             if mf is not None and mf.done() and rf is None:
                 goal_handle = mf.result()
                 if not goal_handle.accepted:
                     self.get_logger().warn("[MOVE] Goal rejected")
+                    # clear handles
                     self._move_future = None
                     self._result_future = None
                     self._move_goal_active = False
@@ -420,22 +420,22 @@ class LStarObstacleChecker(Node):
                 self._result_future = goal_handle.get_result_async()
                 self.get_logger().info("[MOVE] Goal accepted; waiting for result...")
                 return False
-
             # check result
             rf = getattr(self, "_result_future", None)
             if rf is not None and not rf.done():
                 return False
-
             if rf is not None and rf.done():
                 res = rf.result()
                 ok = (res is not None) and (res.result.error_code.val == 1)
                 self.get_logger().info(f"[MOVE] Done: {'OK' if ok else 'FAIL'}")
+                # idempotent cleanup
                 self._move_future = None
                 self._result_future = None
                 self._move_goal_active = False
                 return True
-
             return False
+
+
 
     # ---------- Cloud ----------
     def _on_cloud(self, msg: PointCloud2):
@@ -466,7 +466,7 @@ class LStarObstacleChecker(Node):
             return None
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.target_frame, msg.header.frame_id, rclpy.time.Time(), timeout=Duration(seconds=0.75)
+                self.target_frame, msg.header.frame_id, rclpy.time.Time(), timeout=Duration(seconds=0.5)
             )
         except Exception:
             self.get_logger().warn(f"[TF] lookup failed: {self.target_frame}<-{msg.header.frame_id}")
@@ -731,9 +731,11 @@ class LStarObstacleChecker(Node):
                         gh.cancel_goal_async()
             except Exception:
                 self.get_logger().warn("[MOVE] Exception while cancelling previous goal")
+            # idempotent clear
             self._move_future = None
             self._result_future = None
             self._move_goal_active = False
+
 
     def _finish_success(self, coverage: float):
         blocked = (coverage < self.vis_ok_thresh)
@@ -745,6 +747,7 @@ class LStarObstacleChecker(Node):
         try:
             self._job_done_evt.set()
         except Exception:
+            self.get_logger().warn("[JOB] Exception setting done event")
             pass
 
     def _finish_failure(self):
@@ -756,6 +759,7 @@ class LStarObstacleChecker(Node):
         try:
             self._job_done_evt.set()
         except Exception:
+            self.get_logger().warn("[JOB] Exception setting done event")
             pass
 
     def _schedule_orient_to_initial_view(self, req) -> bool:
@@ -782,7 +786,12 @@ class LStarObstacleChecker(Node):
             self._move_future = self.movegroup_ac.send_goal_async(goal)
             self._result_future = None
             self._move_goal_active = True
-        self.get_logger().info("[MOVE] Initial orient goal sent")
+        try:
+            self.get_logger().info("[VIEW] Initial orientation goal scheduled")
+        except Exception:
+            self.get_logger().warn("[VIEW] Exception logging initial orientation scheduling")
+            pass
+
         return True
 
     def _iterate_once(self):
@@ -808,8 +817,6 @@ class LStarObstacleChecker(Node):
     # ---------- State machine tick ----------
     def _process_job_tick(self):
         self._tick_count += 1
-
-        # Debug heartbeat (uses ROS time for stamping logs; fine)
         now_ns = self.get_clock().now().nanoseconds
         if now_ns - self._last_tick_log_ns > 2e9:
             self.get_logger().info(f"[DBG] tick={self._tick_count} state={self._job_state}")
@@ -818,9 +825,9 @@ class LStarObstacleChecker(Node):
         if not self._job_active:
             return
 
-        # Deadline check against monotonic (steady) time
         if time.monotonic() >= getattr(self, "_job_deadline_monotonic", float("inf")):
-            self.get_logger().warn("[JOB] deadline reached (monotonic)")
+            # Deadline check against steady (monotonic) time
+            self.get_logger().warn("[JOB] ROS time deadline reached")
             self._finish_failure()
             return
 
@@ -863,6 +870,7 @@ class LStarObstacleChecker(Node):
                 return
 
         except Exception as e:
+            # RcutilsLogger has no .exception(); log stack manually
             tb = traceback.format_exc()
             self.get_logger().error(f"[JOB] Tick error: {e}\n{tb}")
             self._finish_failure()
@@ -874,19 +882,17 @@ class LStarObstacleChecker(Node):
             resp.obstacle_present = True
             return resp
 
-        # Clean start
         self._reset_motion_handles()
         self._last_result_blocked = True
+
+        # Reset/wipe completion signal
         self._job_done_evt.clear()
 
         self._job_active = True
         self._job_cancel = False
         self._job_state = "INIT"
         self._job_req = req
-
-        # Use monotonic deadline (sim-time independent)
         self._job_deadline_monotonic = time.monotonic() + float(req.duration_sec)
-
         try:
             self._roi_rect = (float(req.center_x), float(req.center_y), float(req.length), float(req.width))
             self._box_fp = (
@@ -915,16 +921,16 @@ class LStarObstacleChecker(Node):
             float(self.grid_cell_m),
         )
 
-        # ---- NO nested spinning: just wait for completion signal ----
+        # Wait (wall/monotonic) for job to complete; no nested spinning
         hard_timeout_s = float(req.duration_sec) + 3.0  # cushion for MoveIt/TF
         self._job_done_evt.wait(timeout=hard_timeout_s)
         self._job_done_evt.clear()
-
         if self._job_active:
             self.get_logger().warn("[SERVICE] Timeout/cancel while job active -> forcing blocked=True")
             self._last_result_blocked = True
             self._job_active = False
             self._job_state = "IDLE"
+            # ensure we don't leave stray goal handles around
             self._reset_motion_handles()
 
         resp.obstacle_present = bool(self._last_result_blocked)
@@ -936,7 +942,7 @@ def main():
     rclpy.init()
     node = LStarObstacleChecker()
     try:
-        executor = MultiThreadedExecutor(num_threads=2)
+        executor = MultiThreadedExecutor(num_threads=4)
         executor.add_node(node)
         executor.spin()
     except KeyboardInterrupt:

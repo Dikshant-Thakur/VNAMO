@@ -10,11 +10,16 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 
+import sensor_msgs.msg  # <-- Add this import
+
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 
 from visualization_msgs.msg import Marker
 from std_msgs.msg import Header
+
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+
 
 
 
@@ -47,6 +52,7 @@ from moveit_msgs.msg import (
     BoundingVolume,
     JointConstraint,
 )
+
 
 from shape_msgs.msg import SolidPrimitive
 
@@ -92,6 +98,13 @@ class LStarObstacleChecker(Node):
     def __init__(self):
         super().__init__('lstar_obstacle_checker')
 
+
+
+        self._tick_count = 0
+        self._last_tick_log_ns = 0
+        self._cloud_rx_count = 0
+        self._last_age_log_ns = 0
+
         #--- Callback group for Multithreading ---
         self.cbgroup = ReentrantCallbackGroup()
 
@@ -120,12 +133,23 @@ class LStarObstacleChecker(Node):
         # MoveGroup action client (plan+execute)
         self.movegroup_ac = ActionClient(self, MoveGroup, 'move_action', callback_group=self.cbgroup)
 
+
+        self._job_active = False
+        self._job_cancel = False
+        self._job_state = "IDLE"
+        self._job_req = None
+        self._job_deadline_ns = 0
+
+        self._tick = self.create_timer(0.05, self._process_job_tick)
+        self._last_result_blocked: bool = True  # default safe
+
+
         # IK service client
         # self.ik_cli = self.create_client(GetPositionIK, '/compute_ik')
-
-
-
-
+        # To track
+        self.stop_cov_thresh = self.declare_parameter("stop_cov_thresh", 0.90).value
+        self._cov_grid = None
+        self._cov_meta = None
         # ---- Parameters (tweak if needed) ----
         self.declare_parameter('cloud_topic', '/realsense/depth/color/points')
         self.declare_parameter('target_frame', 'map')
@@ -137,7 +161,7 @@ class LStarObstacleChecker(Node):
         self.declare_parameter('min_obst_pts', 500)       # >= => obstacle
         self.declare_parameter('z_free_max', 0.15)      # <= => free band upper (m, absolute z in map)
         self.declare_parameter('z_max_clip', 2.50)      # ignore points above this (m)
-        self.declare_parameter('stale_cloud_sec', 1.0)  # no cloud newer than this => FAILURE
+        self.declare_parameter('stale_cloud_sec', 2.5)  # no cloud newer than this => FAILURE
         self.declare_parameter('max_points_process', 120000)  # limit for speed
         self.declare_parameter('marker_ns', 'lstar_roi')
 
@@ -159,10 +183,28 @@ class LStarObstacleChecker(Node):
         # ---- Subscribers / Publishers ----
         self._last_cloud_msg: Optional[PointCloud2] = None
         self._last_cloud_stamp_ns: Optional[int] = None
+        # self.cloud_sub = self.create_subscription(
+        #     PointCloud2, self.cloud_topic, self._on_cloud, 10,
+        #     callback_group=self.cbgroup
+        # )
+        qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,      # same as Gazebo publisher
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=QoSDurabilityPolicy.VOLATILE          # transient_local publisher se compatible
+        )
         self.cloud_sub = self.create_subscription(
-            PointCloud2, self.cloud_topic, self._on_cloud, 10,
+            PointCloud2,
+            self.cloud_topic,
+            self._on_cloud,
+            qos_profile=qos_profile,        # ← Named parameter
             callback_group=self.cbgroup
         )
+
+
+        # self.cloud_sub = self.create_subscription(PointCloud2, self.cloud_topic, self._on_cloud, qos_profile_sensor_data)
+
+
 
         self.marker_pub = self.create_publisher(Marker, 'roi_marker', 10)
 
@@ -225,7 +267,21 @@ class LStarObstacleChecker(Node):
         return self._rotmat_to_quat_xyzw(Rm)
 
 
-
+    def _reset_motion_handles(self):
+        # Purane MoveIt handles ko purge karo taaki next job clean start ho
+        if hasattr(self, "_move_future"):
+            try:
+                # goal handle mila to cancel ki koshish kar lo (best-effort)
+                self.get_logger().info("[MOVE] Resetting previous motion handles")
+                gh = self._move_future.result() if self._move_future.done() else None
+                if gh is not None and hasattr(gh, "cancel_goal_async"):
+                    gh.cancel_goal_async()  # fire-and-forget
+            except Exception:
+                self.get_logger().warn("[MOVE] Exception while cancelling previous goal")
+                pass
+            del self._move_future
+        if hasattr(self, "_result_future"):
+            del self._result_future
 
     
     def _ensure_cam_ee_tf(self) -> bool:
@@ -238,7 +294,7 @@ class LStarObstacleChecker(Node):
                 self.ee_link,               # source
                 rclpy.time.Time(),
                 timeout=Duration(seconds=1.0),
-            )
+            ) # CAM<-EE - ee ki position in camera frame
             self.T_cam_ee = tf_to_matrix(tf_cam_ee)
             self.T_ee_cam = np.linalg.inv(self.T_cam_ee)
             self.get_logger().info("[TF] Cached T_cam_ee and T_ee_cam")
@@ -333,7 +389,7 @@ class LStarObstacleChecker(Node):
             self.get_logger().info("[VIEW] Getting current camera pose...")
             tf_cam_now = self.tf_buffer.lookup_transform(
                 planning_frame, self.CAMERA_OPTICAL_FRAME, rclpy.time.Time(), timeout=Duration(seconds=0.5)
-            )
+            ) # CAMERA_OPTICAL_FRAME in planning_frame
             cam_pos_now = np.array([
                 tf_cam_now.transform.translation.x,
                 tf_cam_now.transform.translation.y,
@@ -352,6 +408,7 @@ class LStarObstacleChecker(Node):
             ], dtype=float)
 
         # 2) Naya camera rotation: +Z target ki taraf
+        
         z_cam = target_w - cam_pos_now #Δz = 0
         self.get_logger().info(f"[VIEW] Orienting camera at target {target_w} from {cam_pos_now}")
         nz = np.linalg.norm(z_cam) #Vectror length from camera to target
@@ -366,8 +423,8 @@ class LStarObstacleChecker(Node):
 
         x_cam = np.cross(up, z_cam); x_cam /= (np.linalg.norm(x_cam) + 1e-9)
         y_cam = np.cross(z_cam, x_cam)
-        # Hit & Trial se ulti kr dee axis kyunki camera frame me aisa hai.
-        y_cam = -y_cam; 
+        # Hit & Trial se ulti kr dee axis kygoal unki camera frame me aisa hai.
+        y_cam = -y_cam
         x_cam = -x_cam
 
         R_w_cam = np.column_stack((x_cam, y_cam, z_cam)) #rotation matrix of desuired camera frame in world frame
@@ -381,7 +438,7 @@ class LStarObstacleChecker(Node):
         T_w_cam[0:3, 3]   = cam_pos_now  # <-- POSITION LOCKED
 
         # 4) EE pose from camera pose
-        # T_w_ee = T_w_cam @ self.T_ee_cam
+        #T_w_ee = T_w_cam @ self.T_ee_cam
         T_w_ee = T_w_cam @ self.T_cam_ee
 
         ps = PoseStamped()
@@ -399,68 +456,7 @@ class LStarObstacleChecker(Node):
     
 
 
-    # def _plan_execute_orient_only(self, pose_stamped: PoseStamped, pos_lock_tol: float = 0.02) -> bool:
-    #     """
-    #     EE position ko chhote box (±pos_lock_tol) me lock karo,
-    #     aur orientation ko pose_stamped.orientation pe align karao.
-    #     """
-    #     if not self.movegroup_ac.wait_for_server(timeout_sec=1.0):
-    #         self.get_logger().error("[MOVEIT] MoveGroup server not available")
-    #         return False
 
-    #     # Position lock around the SAME position
-    #     pc = PositionConstraint()
-    #     pc.header.frame_id = pose_stamped.header.frame_id
-    #     pc.link_name = self.ee_link
-    #     from geometry_msgs.msg import Pose as GeoPose
-    #     lock_pose = GeoPose()
-    #     lock_pose.position = pose_stamped.pose.position
-    #     pc.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.BOX,
-    #                                                     dimensions=[2*pos_lock_tol,
-    #                                                                 2*pos_lock_tol,
-    #                                                                 2*pos_lock_tol])]
-    #     pc.constraint_region.primitive_poses = [lock_pose]
-    #     pc.weight = 1.0
-
-    #     # Orientation goal (~3 deg tolerance)
-    #     oc = OrientationConstraint()
-    #     oc.header.frame_id = pose_stamped.header.frame_id
-    #     oc.link_name = self.ee_link
-    #     oc.orientation = pose_stamped.pose.orientation
-    #     oc.absolute_x_axis_tolerance = math.radians(3.0)
-    #     oc.absolute_y_axis_tolerance = math.radians(3.0)
-    #     oc.absolute_z_axis_tolerance = math.radians(3.0)
-    #     oc.weight = 1.0
-
-    #     cons = Constraints()
-    #     cons.position_constraints = [pc]
-    #     cons.orientation_constraints = [oc]
-
-    #     req = MotionPlanRequest()
-    #     req.group_name = self.moveit_group_name
-    #     req.goal_constraints = [cons]
-    #     req.allowed_planning_time = 2.0
-    #     req.num_planning_attempts = 2
-
-    #     opts = PlanningOptions()
-    #     opts.plan_only = False
-    #     opts.look_around = False
-    #     opts.replan = False
-
-    #     goal = MoveGroup.Goal()
-    #     goal.request = req
-    #     goal.planning_options = opts
-
-    #     send = self.movegroup_ac.send_goal_async(goal)
-    #     rclpy.spin_until_future_complete(self, send, timeout_sec=3.0)
-    #     gh = send.result()
-    #     if gh is None:
-    #         return False
-
-    #     res_fut = gh.get_result_async()
-    #     rclpy.spin_until_future_complete(self, res_fut, timeout_sec=10.0)
-    #     res = res_fut.result()
-    #     return bool(res) and (res.result.error_code.val >= 0)
 
     def _plan_execute_orient_only(
         self,
@@ -561,156 +557,496 @@ class LStarObstacleChecker(Node):
         except Exception as ex:
             self.get_logger().error(f"[MOVEIT] exception in _plan_execute_orient_only: {ex}")
             return False
+        
+    # schedule (no blocking wait)
+    def _schedule_orient_to_point(self, xy):
+        self.get_logger().info(f"[VIEW] scheduling next look-at xy=({float(xy[0]):.2f}, {float(xy[1]):.2f})")
+        goal = self._build_orient_only_goal_to(xy)
+        self._move_future = self.movegroup_ac.send_goal_async(goal)
+        # don't wait here; timer tick me poll karenge
+        return True
+
+    def _moveit_motion_done(self) -> bool:
+        # 1) if goal future not done yet, return False
+        if hasattr(self, "_move_future") and not self._move_future.done():
+            return False
+        # 2) if goal accepted but result future pending, return False
+        if hasattr(self, "_result_future") and not self._result_future.done():
+            return False
+        # 3) handle transitions
+        if hasattr(self, "_move_future") and self._move_future.done() and not hasattr(self, "_result_future"):
+            goal_handle = self._move_future.result()
+            if not goal_handle.accepted:
+                self.get_logger().warn("[MOVE] Goal rejected")
+                return True  # treat as done; state machine will decide
+            self._result_future = goal_handle.get_result_async()
+            return False
+        if hasattr(self, "_result_future") and self._result_future.done():
+            res = self._result_future.result()
+            ok = (res is not None) and (res.result.error_code.val == 1)  # MoveIt SUCCESS
+            self.get_logger().info(f"[MOVE] Done: {'OK' if ok else 'FAIL'}")
+            # cleanup
+            del self._move_future
+            del self._result_future
+            return True
+        return False
+    
+    # add another service
+    def _on_cancel(self, req, resp):
+        self._job_cancel = True
+        return resp
+    
+    def _iterate_once(self):
+        # guard: fresh cloud?
+        # if not self._is_cloud_fresh(2.5):
+        #     # return (step_done=False, coverage=None, centroid=None) -> tick will try again
+        #     self.get_logger().warn("[CHECK] No fresh cloud")
+        #     return False, None, None
+        if not self._is_cloud_fresh(self.stale_cloud_s):
+            age_s = (self.get_clock().now().nanoseconds - (self._last_cloud_stamp_ns or 0)) / 1e9
+            self.get_logger().warn(f"[CHECK] No fresh cloud | age={age_s:.3f}s (limit={self.stale_cloud_s:.2f}s)")
+            return False, None, None
+
+        # small chunk of work: transform + ROI mask + coverage
+        Pm = self._get_cloud_in_map_nonblocking()   # ensure this is quick (no TF long waits)
+        cov, centroid = self._compute_roi_coverage(Pm)
+        self.get_logger().info(f"[ITER] coverage={cov*100:.1f}% | next_xy={None if centroid is None else tuple(np.round(centroid,3))}")
+
+
+
+        roi_marker = self._make_roi_marker(Pm, cov)
+        self.marker_pub.publish(roi_marker)
+
+        # optional: publish progress
+        # self.coverage_pub.publish(...)
+
+        # Decide: need next orient?
+        if cov >= 0.90 or self._job_cancel:
+            self.get_logger().info(f"[CHECK] DONE: coverage={cov*100:.1f}%")
+            return True, cov, None
+        else:
+            return True, cov, centroid
+
+
+
+        # Schedule the very first orient (no blocking; just queue a MoveIt action)
+    def _schedule_orient_to_initial_view(self, req) -> bool:
+        if not self._ensure_cam_ee_tf():
+            return False
+
+        # choose target point at requested yaw and center; keep current Z as you already log
+        # try:
+        #     cam_tf = self.tf_buffer.lookup_transform(self.target_frame, self.CAMERA_OPTICAL_FRAME, rclpy.time.Time(), timeout=Duration(seconds=0.5))
+        #     cam_z = float(cam_tf.transform.translation.z)
+        # except Exception:
+        #     cam_z = float(self.view_z_fixed)
+        target_x_map = float(req.center_x)
+        target_y_map = float(req.center_y)
+        target_x_pl, target_y_pl, target_z_pl = self._transform_point_xy(
+        target_x_map, target_y_map, 
+        from_frame=self.target_frame,     # "map"
+        to_frame=self.planning_frame      # "ur_base'_link"
+    )
+        self.get_logger().info(f"[VIEW] Target MAP: ({target_x_map:.2f}, {target_y_map:.2f}) -> PLANNING: ({target_x_pl:.2f}, {target_y_pl:.2f})")
+
+        target_z_pl = 0.0
+
+        yaw = float(req.yaw)
+        target = np.array([target_x_pl, target_y_pl, target_z_pl], dtype=float)
+        self.get_logger().info(f"[VIEW] Direction is {math.degrees(yaw):.1f}, Target is {target}")
+
+        pose_ee = self._ee_pose_orient_only(target, self.planning_frame)
+        if pose_ee is None:
+            self.get_logger().warn("[VIEW] Could not compute EE pose")
+            return False
+
+        goal = self._build_orient_only_goal_from_pose(pose_ee)
+        self._move_future = self.movegroup_ac.send_goal_async(goal)  # don't wait
+        return True
+
+    # Build a MoveGroup goal from a PoseStamped (orientation-only with position lock)
+    def _build_orient_only_goal_from_pose(self, pose_stamped):
+        oc = OrientationConstraint()
+        oc.header = pose_stamped.header
+        oc.link_name = self.ee_link
+        oc.orientation = pose_stamped.pose.orientation
+        oc.absolute_x_axis_tolerance = math.radians(5.0)
+        oc.absolute_y_axis_tolerance = math.radians(5.0)
+        oc.absolute_z_axis_tolerance = math.radians(5.0)
+        oc.weight = 1.0
+
+        sphere = SolidPrimitive()
+        sphere.type = SolidPrimitive.SPHERE
+        sphere.dimensions = [0.02]  # 2cm lock
+
+        center = Pose()
+        center.position = pose_stamped.pose.position
+        center.orientation.w = 1.0
+
+        bv = BoundingVolume()
+        bv.primitives = [sphere]
+        bv.primitive_poses = [center]
+
+        pc = PositionConstraint()
+        pc.header = pose_stamped.header
+        pc.link_name = self.ee_link
+        pc.constraint_region = bv
+        pc.weight = 1.0
+
+        cons = Constraints()
+        cons.orientation_constraints = [oc]
+        cons.position_constraints = [pc]
+
+        req = MotionPlanRequest()
+        req.group_name = self.moveit_group_name
+        req.goal_constraints = [cons]
+        req.allowed_planning_time = 2.0
+        req.num_planning_attempts = 1
+
+        opts = PlanningOptions()
+        opts.plan_only = False
+        opts.look_around = False
+        opts.replan = False
+
+        goal = MoveGroup.Goal()
+        goal.request = req
+        goal.planning_options = opts
+        return goal
+
+    # Used by _schedule_orient_to_point(xy): build a goal looking at a new (x,y)
+    def _build_orient_only_goal_to(self, xy):
+        # keep current Z, compute EE pose looking at that XY
+        # try:
+        #     cam_tf = self.tf_buffer.lookup_transform(self.target_frame, self.CAMERA_OPTICAL_FRAME, rclpy.time.Time(), timeout=Duration(seconds=0.5))
+        #     cam_z = float(cam_tf.transform.translation.z)
+        # except Exception:
+        #     cam_z = float(self.view_z_fixed)
+        cam_z = 0.0
+        px, py, pz = self._transform_point_xy(
+            xy[0], xy[1],
+            from_frame=self.target_frame,    # usually "map"
+            to_frame=self.planning_frame     # e.g. "ur_base_link"
+        )
+        target = np.array([float(px), float(py), cam_z], dtype=float)
+        pose_ee = self._ee_pose_orient_only(target, self.planning_frame)
+        return self._build_orient_only_goal_from_pose(pose_ee)
+
+    # Non-blocking cloud pull with small TF timeout
+    def _get_cloud_in_map_nonblocking(self) -> Optional[np.ndarray]:
+        msg = self._last_cloud_msg
+        if msg is None:
+            return None
+        if not self._is_cloud_fresh(self.stale_cloud_s):
+            return None
+        try:
+            tf = self.tf_buffer.lookup_transform(self.target_frame, msg.header.frame_id, rclpy.time.Time(), timeout=Duration(seconds=0.5))
+        except Exception:
+            self.get_logger().warn(f"[TF] lookup failed: {self.target_frame}<-{msg.header.frame_id}")
+            return None
+        T = tf_to_matrix(tf)
+        gen = pc2.read_points(msg, field_names=('x','y','z'), skip_nans=True)
+        pts = np.fromiter(gen, dtype=[('x','f4'),('y','f4'),('z','f4')])
+        if pts.size == 0:
+            self.get_logger().warn("[CLOUD] No points in cloud")
+            return np.empty((0,3), dtype=np.float32)
+        if pts.shape[0] > self.max_points:
+            idx = np.random.choice(pts.shape[0], self.max_points, replace=False)
+            pts = pts[idx]
+        P = np.column_stack((pts['x'], pts['y'], pts['z'])).astype(np.float32)
+        Rm, t = T[:3,:3], T[:3,3]
+        Pm = (P @ Rm.T) + t
+        if self.z_max_clip is not None:
+            Pm = Pm[Pm[:,2] <= self.z_max_clip]
+        return Pm
+
+    # Compute coverage; return (coverage_in_[0..1], centroid_xy or None)
+    def _compute_roi_coverage(self, Pm):
+        """
+        Input:
+        Pm : np.ndarray [N,3]  # point cloud in /map frame (fast, non-blocking)
+
+        Returns:
+        coverage_sim : float in [0,1]  # cumulative coverage (INIT + all ITERATE)
+        next_xy_map  : Optional[np.ndarray] shape (2,)  # uncovered centroid in /map, or None if fully covered
+        """
+        # 1) Basic guards
+        if Pm is None or Pm.size == 0:
+            # If we already have cumulative grid, report its coverage; else 0
+            if getattr(self, "_cov_grid", None) is not None:
+                cov = float(self._cov_grid.sum()) / float(self._cov_grid.size)
+                return cov, None
+            return 0.0, None
+
+        # 2) ROI geometry (anchor/origin)  — centre fixed, area constant for the whole job
+        cx, cy, L, W = self._roi_rect
+        yaw_rad = self._roi_yaw
+
+        # 3) Per-frame evaluation (gets current-frame grid + debug axes)
+        roi_pts, observed_cells, vis_ratio, obst_pts, dbg = self._eval_roi(Pm, cx, cy, L, W, yaw_rad)
+        # dbg layout we rely on: (xp, yp, inside, grid)
+        xp = dbg[0]   # 1D array of cell-centre x (ROI-local)
+        yp = dbg[1]   # 1D array of cell-centre y (ROI-local)
+        grid_frame = dbg[3]  # 2D bool: visible cells in *this* frame
+
+        if grid_frame is None:
+            self.get_logger().warn("[COV] eval_roi returned no grid")
+
+        # 4) ROI identity check (keep it minimal: centre only; extend if you want full geometry safety)
+        # meta_frame = (float(cx), float(cy))
+        # if getattr(self, "_cov_meta", None) != meta_frame:
+        #     self._cov_grid = None
+        #     self._cov_meta = meta_frame
+
+        # 5) Cumulative merge (INIT seed or OR-merge), _cov_grid is a visible grid.
+        if getattr(self, "_cov_grid", None) is None:
+            self._cov_grid = grid_frame.copy()
+        else:
+            # in-place OR is fine too: self._cov_grid |= grid_frame
+            self._cov_grid = np.logical_or(self._cov_grid, grid_frame)
+
+        nx, ny = self._cov_grid.shape  
+        dx = float(L) / nx
+        dy = float(W) / ny
+        xc = (np.arange(nx) + 0.5) * dx - 0.5 * float(L)   # ROI-local x centers
+        yc = (np.arange(ny) + 0.5) * dy - 0.5 * float(W)   # ROI-local y centers
+        Xc, Yc = np.meshgrid(xc, yc, indexing="ij")  # Xc,Yc: (nx,ny)
+        # --- ADD: footprint ko ROI-local me laa kar valid_mask banao ---
+        valid_mask = np.ones_like(self._cov_grid, dtype=bool)
+        try:
+            # Footprint info service se set hoti hai: self._box_fp = (box_cx_map, box_cy_map, box_L, box_W)
+            box_cx_map, box_cy_map, box_L, box_W = self._box_fp
+
+            # Map -> ROI-local (center shift + -yaw rotation)
+            dx_b, dy_b = (box_cx_map - cx), (box_cy_map - cy)
+            c_y, s_y = math.cos(-yaw_rad), math.sin(-yaw_rad)
+            bx = c_y * dx_b - s_y * dy_b   # footprint center in ROI-local (x)
+            by = s_y * dx_b + c_y * dy_b   # footprint center in ROI-local (y)
+
+            # Footprint rectangle mask (chhota margin optional)
+            mx = 0.5 * float(box_L) + 1e-3
+            my = 0.5 * float(box_W) + 1e-3
+            fp_mask = (np.abs(Xc - bx) <= mx) & (np.abs(Yc - by) <= my)
+
+            valid_mask &= ~fp_mask
+        except Exception:
+            # agar footprint info nahi mili to sab valid hi rehne do
+            self.get_logger().info("[COV] No footprint info; skipping valid_mask")
+            pass
+
+        # 6) Cumulative coverage
+        # total_cells = int(self._cov_grid.size)
+        # observed_cells_cum = int(self._cov_grid.sum())
+        # coverage_sim = observed_cells_cum / float(total_cells)
+        # self.get_logger().info(
+        #     f"[COV] cum={coverage_sim*100:.1f}% ({observed_cells_cum}/{total_cells})"
+        # )
+
+        cov_grid_valid = self._cov_grid.copy()
+        cov_grid_valid[~valid_mask] = False
+        valid_total = int(valid_mask.sum())
+        if valid_total > 0:
+            observed_cells_cum = int(cov_grid_valid.sum())
+            coverage_sim = observed_cells_cum / float(valid_total)
+            self.get_logger().info(f"[COV_VALID] cum={coverage_sim*100:.1f}% ({observed_cells_cum}/{valid_total})")
+        else:
+            self.get_logger().warn("[COV] valid_total=0; check ROI/footprint.")
+            coverage_sim = 0.0
+
+        # 7) Uncovered-centre target in /map
+
+
+        uncovered_valid = valid_mask & (~self._cov_grid)
+        if uncovered_valid.any():
+            lx = float(Xc[uncovered_valid].mean())
+            ly = float(Yc[uncovered_valid].mean())
+            next_xy_map = self._roi_local_to_world(cx, cy, yaw_rad, lx, ly)
+            next_xy_map = np.asarray(next_xy_map[:2], dtype=float)
+            self.get_logger().info(
+                f"[UNCOVERED_CENTER] New uncovered region center: MAP({next_xy_map[0]:.3f}, {next_xy_map[1]:.3f}) | ROI_LOCAL({lx:.3f}, {ly:.3f}) [valid]"
+            )
+        else:
+            self.get_logger().info("[COV] Full (valid) coverage achieved")
+            next_xy_map = None  # everything already covered
+
+        return float(coverage_sim), next_xy_map
+
+    # Make a simple marker (if you don’t already have one)
+    def _make_roi_marker(self, Pm, coverage):
+        m = Marker()
+        m.header.frame_id = self.target_frame
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = self.marker_ns
+        m.id = 99
+        m.type = Marker.TEXT_VIEW_FACING
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.16
+        m.color.a = 1.0
+        m.color.r = 0.1; m.color.g = 0.9; m.color.b = 0.2
+        m.text = f"Coverage: {coverage*100:.1f}%"
+        # place at ROI center if available
+        try:
+            cx, cy, _, _ = self._roi_rect
+            m.pose.position.x = float(cx)
+            m.pose.position.y = float(cy)
+            m.pose.position.z = 0.4
+        except Exception:
+            pass
+        return m
+
+    # === PATCH: finalization helpers set the last result & stop the job ===
+    def _finish_success(self, coverage: float):
+        blocked = (coverage < self.vis_ok_thresh)
+        self._last_result_blocked = bool(blocked)
+        self.get_logger().info(f"[RESULT] coverage={coverage*100:.1f}% -> obstacle_present={blocked}")
+        self._reset_motion_handles()          # <-- ADD THIS
+        self._job_active = False
+        self._job_state = "IDLE"
+
+    def _finish_failure(self):
+        self._last_result_blocked = True
+        self.get_logger().warn("[RESULT] failure path -> obstacle_present=True")
+        self._reset_motion_handles()          # <-- ADD THIS
+        self._job_active = False
+        self._job_state = "IDLE"
+
 
 
     
     # ------------------- Service callback -------------------
+    # === PATCH: cooperative state machine tick ===
+    def _process_job_tick(self):
+        self._tick_count += 1
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._last_tick_log_ns > 2e9:  # ~ every 2s
+            self.get_logger().info(f"[DBG] tick={self._tick_count} state={self._job_state}")
+            self._last_tick_log_ns = now_ns
 
-    def _on_check_area(self, req: VisibilityCheck.Request, resp: VisibilityCheck.Response):
-        # ---- Pre-check: TF & cloud availability ----
-        cloud_frame = self._last_cloud_msg.header.frame_id if self._last_cloud_msg else None
-        if cloud_frame:
-            ok = self.tf_buffer.can_transform(self.target_frame, cloud_frame, rclpy.time.Time(),
-                                            rclpy.duration.Duration(seconds=2.0))
-            if not ok:
-                self.get_logger().warn(f"[FAILURE] TF not ready {self.target_frame}<-{cloud_frame} (pre-check).")
-                self._diagnose_tf_issue(self.target_frame, cloud_frame, cloud_stamp=self._last_cloud_msg.header.stamp)
-                resp = VisibilityCheck.Response()
-                resp.obstacle_present = True  # safe
-                return resp
-        else:
-            self.get_logger().warn("[FAILURE] No cloud received yet (no frame_id available) during pre-check.")
-            resp = VisibilityCheck.Response()
-            resp.obstacle_present = True
-            return resp
+        if not self._job_active:
+            self.get_logger().debug("[JOB] Idle")
+            return
 
-        # ---- Parse request ----
-        cx = float(req.center_x)
-        cy = float(req.center_y)
-        L  = float(req.length)
-        W  = float(req.width)
-        yaw= float(req.yaw)
-        dur= float(req.duration_sec)
-        self._box_fp = (req.box_center_x, req.box_center_y, req.box_length, req.box_width)
+        # Timeout guard via ROS clock (secondary to monotonic in service)
+        if self.get_clock().now().nanoseconds >= self._job_deadline_ns:
+            self.get_logger().warn("[JOB] ROS time deadline reached")
+            self._finish_failure()
+            return
 
-
-        self.get_logger().info(f"[CHECK] Request: center=({cx:.2f},{cy:.2f}) L={L:.2f} W={W:.2f} yaw={math.degrees(yaw):.1f}° dur={dur:.1f}s")
-
-        # === VIEW ACQUISITION: orientation-only (lock position) ===
         try:
-            # 0) Ensure CAM<->EE TF cached
-            if not self._ensure_cam_ee_tf():
-                self.get_logger().error("[VIEW] Missing CAM<->EE TF; cannot proceed.")
-                resp.obstacle_present = True
-                return resp
+            if self._job_state == "INIT":
+                ok = self._schedule_orient_to_initial_view(self._job_req)  # async send; no waiting
+                # After INIT orientation completes and you have a fresh cloud in MAP:
+                # Pm = self._get_cloud_in_map_nonblocking()
+                # if Pm is not None:
+                #     # ROI params already available here: cx, cy, L, W, yaw_rad
+                #     roi_pts, observed_cells, vis_ratio, obst_pts, dbg = self._eval_roi(Pm, cx, cy, L, W, yaw_rad)
+                #     grid_frame = dbg[3]
+                #     if grid_frame is not None:
+                #         # --- SEED cumulative memory from the first look ---
+                #         self._cov_grid = grid_frame.copy()
+                #         self._cov_meta = (float(cx), float(cy), float(L), float(W), float(yaw_rad), float(self.grid_cell_m))
+                #         # Optional: first cumulative coverage (for logs/marker)
+                #         coverage_sim = float(self._cov_grid.sum()) / float(self._cov_grid.size)
+                #         self.get_logger().info(f"[COV] INIT seeded: {coverage_sim*100:.1f}%")
 
-            # 1) ROI centre ko planning_frame me lao
-            cx_pf, cy_pf, z_pf = (cx, cy, 0.0)
-            if self.target_frame != self.planning_frame:
-                cx_pf, cy_pf, z_pf = self._transform_point_xy(cx, cy, self.target_frame, self.planning_frame)
-                # /map frame cx,cy ko /ur_base_link me dal diya.
+                self._job_state = "WAIT_INIT_ORIENT" if ok else "FAIL"
+                return
 
-            # 2) Target Z choose (tumhare hi params follow)
-            if self.view_z_mode == 'fixed':
-                z_target = self.view_z_fixed
-                self.get_logger().info(f"[VIEW] Using fixed z={z_target:.3f}m as target z.")
-            else:
-                try:
-                    tf_cam = self.tf_buffer.lookup_transform(
-                        self.planning_frame, self.CAMERA_OPTICAL_FRAME, rclpy.time.Time(),
-                        timeout=Duration(seconds=0.5)
-                    )
-                    z_target = float(tf_cam.transform.translation.z)
-                    self.get_logger().info(f"[VIEW] Using current camera z={z_target:.3f}m as target z.")
-                except Exception:
-                    z_target = self.view_z_fixed
-                    self.get_logger().warn(f"[VIEW] Camera TF failed; falling back to fixed z={z_target:.3f}m.")
+            if self._job_state == "WAIT_INIT_ORIENT":
+                if self._moveit_motion_done():  # poll futures; no blocking
+                    self._job_state = "ITERATE"
+                return
 
-            # target = np.array([cx_pf, cy_pf, z_target], dtype=float)
-            target = np.array([cx_pf, cy_pf, 0.0], dtype=float)
+            if self._job_state == "ITERATE":
+                step_done, coverage, next_xy = self._iterate_once()  # ek chhota chunk
+                if not step_done:
+                    self.get_logger().warn("[CHECK] Waiting for fresh cloud...")
+                    return
+                if coverage is not None and coverage >= self.stop_cov_thresh:
+                    self.get_logger().info(f"[CHECK] Reached stop_cov_thresh={self.stop_cov_thresh*100:.1f}% -> finishing")
+                    self._finish_success(coverage)  # this will set obstacle_present using your existing vis_ok_thresh logic
+                    return
+                if next_xy is None:
+                    # no next view but not enough coverage => conservative
+                    self._finish_failure()
+                    return
+                # schedule next orient
+                self._schedule_orient_to_point(next_xy)
+                self._job_state = "WAIT_STEP_ORIENT"
+                return
 
+            if self._job_state == "WAIT_STEP_ORIENT":
+                if self._moveit_motion_done():
+                    self._job_state = "ITERATE"
+                return
 
-            # 3) Sirf orientation wala EE pose banao (xyz same, sirf q change)
-            ee_pose = self._ee_pose_orient_only(target, self.planning_frame)
-            if ee_pose is None:
-                self.get_logger().error("[VIEW] orient-only pose build failed.")
-                resp.obstacle_present = True
-                return resp
+            if self._job_state == "FAIL":
+                self._finish_failure()
+                return
 
-            # 4) Planner: position lock (tiny box) + orientation goal
-            if not self._plan_execute_orient_only(ee_pose, pos_tol=0.02):
-                self.get_logger().error("[VIEW] Orientation-only failed.")
-                resp.obstacle_present = True
-                return resp
+        except Exception as e:
+            self.get_logger().exception(f"[JOB] Tick error: {e}")
+            self._finish_failure()
 
-            time.sleep(0.4)  # small settle
-
-        except Exception as ex:
-            self.get_logger().error(f"[VIEW] exception: {ex}")
+    # ---- NON-BLOCKING SERVICE: start job and return immediately ----
+    # === PATCH: service handler – start job and block cooperatively until done ===
+    def _on_check_area(self, req, resp):
+        if self._job_active:
+            self.get_logger().warn("[SERVICE] Busy; rejecting new request.")
+            # Sirf yahi field exist karti hai:
             resp.obstacle_present = True
             return resp
+        self._reset_motion_handles()
+        self._last_result_blocked = True 
 
-        # === Iterative Visibility Evaluation Loop ===
-        t0 = self.get_clock().now().nanoseconds
-        end_ns = t0 + int(dur * 1e9)
-        blocked_final = True
-        failure_flag = False
-        coverage_grid = None  # accumulated visibility grid
+        # Stage job for state machine
+        self._job_active = True
+        self._job_cancel = False
+        self._job_state = "INIT"
+        self._job_req = req
+        self._job_deadline_ns = (self.get_clock().now() + rclpy.duration.Duration(
+            seconds=float(req.duration_sec))
+        ).nanoseconds
 
-        step = 0
-        while rclpy.ok() and self.get_clock().now().nanoseconds < end_ns:
-            step += 1
-            Pm = self._get_cloud_in_map()
-            if Pm is None:
-                failure_flag = True
-                self.get_logger().warn("[FAILURE] No usable pointcloud (stale or TF error).")
-                time.sleep(0.2)
-                continue
+        # Optional: box footprint if provided, else ROI dims
+        try:
+            self._roi_rect = (float(req.center_x), float(req.center_y),
+                              float(req.length),   float(req.width))
+            self._box_fp = (float(req.box_center_x), float(req.box_center_y),
+                            float(req.box_length),   float(req.box_width))
+            self._roi_yaw = float(req.yaw)
+        except Exception:
+            self.get_logger().warn("[SERVICE] Invalid box footprint in request; using ROI dims only.")
+        self.get_logger().info(
+            f"[SERVICE] Accepted: center=({req.center_x:.2f},{req.center_y:.2f}) "
+            f"L={req.length:.2f} W={req.width:.2f} yaw={math.degrees(float(req.yaw)):.1f}° "
+            f"dur={req.duration_sec:.1f}s"
+        )
+        # CUMULATIVE COVERAGE RESET (per new job)
+        self._cov_grid = None
+        self._cov_meta = (float(req.center_x), float(req.center_y),
+                        float(req.length),   float(req.width),
+                        float(req.yaw),      float(self.grid_cell_m))
 
-            roi_pts, observed_cells, vis, obst_pts, (xp, yp, inside, grid) = self._eval_roi(Pm, cx, cy, L, W, yaw)
+        # === Cooperative wait loop ===
+        # NOTE: yeh loop executor ko block nahi karta; har turn pe spin_once dusre callbacks chalata rahega.
+        hard_timeout_s = float(req.duration_sec) + 3.0  # small buffer
+        t_stop = time.monotonic() + hard_timeout_s
+        while rclpy.ok() and self._job_active and time.monotonic() < t_stop:
+            rclpy.spin_once(self, timeout_sec=0.02)
 
-            # merge new grid with previous coverage
-            coverage_grid = self._merge_coverages(coverage_grid, grid)
-            vis_now = float(coverage_grid.sum()) / float(coverage_grid.size)
-            self.get_logger().info(f"[ITER] Step {step}: ROI coverage={vis_now*100:.1f}% | pts={roi_pts}")
+        # Timeout/cancel guard
+        if self._job_active:
+            self.get_logger().warn("[SERVICE] Timeout/cancel while job active -> forcing blocked=True")
+            self._last_result_blocked = True
+            self._job_active = False
+            self._job_state = "IDLE"
 
-            # if coverage good enough, stop
-            if vis_now >= 0.90:
-                self.get_logger().info("[ITER] ROI visibility sufficient ✅")
-                blocked_final = False
-                break
-
-            # compute uncovered centroid in ROI frame
-            lx, ly = self._compute_uncovered_centroid(coverage_grid, L, W)
-            cx_new, cy_new = self._roi_local_to_world(cx, cy, yaw, lx, ly)
-            self.get_logger().info(f"[ITER] Moving camera to uncovered centroid ({cx_new:.2f}, {cy_new:.2f})")
-
-            # orient camera toward new centroid
-            try:
-                ee_pose = self._ee_pose_orient_only(np.array([cx_new, cy_new, 0.0]), self.planning_frame)
-                if ee_pose is not None:
-                    self._plan_execute_orient_only(ee_pose, pos_tol=0.02)
-                    time.sleep(0.6)
-                else:
-                    self.get_logger().warn("[ITER] Could not build new EE pose; skipping move.")
-            except Exception as ex:
-                self.get_logger().warn(f"[ITER] Reorient failed: {ex}")
-                time.sleep(0.5)
-                continue
-
-            # continue until duration expires or enough coverage
-            time.sleep(0.5)
-
-        # Final marker color
-        color = (0.1, 0.8, 0.2, 0.35) if not blocked_final else (0.9, 0.1, 0.1, 0.35)
-        self._publish_roi_marker(cx, cy, L, W, yaw, color=color)
-
-        if failure_flag:
-            self.get_logger().warn("[FAILURE] Returning blocked=True due to stale cloud/TF issues.")
-
-        resp.obstacle_present = bool(blocked_final)
-        self.get_logger().info(f"[RESULT] obstacle_present={resp.obstacle_present}")
+        # === Final synchronous result (ONLY field in the .srv response) ===
+        resp.obstacle_present = bool(self._last_result_blocked)
         return resp
+
+
 
 
 
@@ -721,10 +1057,30 @@ class LStarObstacleChecker(Node):
 
     # ------------------- Cloud callback -------------------
 
-    def _on_cloud(self, msg: PointCloud2):
+    # === PATCH: use header stamp for freshness ===
+    def _on_cloud(self, msg):
         self._last_cloud_msg = msg
-        self._last_cloud_stamp_ns = self.get_clock().now().nanoseconds
-        self.get_logger().debug(f"[CLOUD] received {msg.width}x{msg.height} points in frame {msg.header.frame_id} with timestamp {self._last_cloud_stamp_ns}")
+        try:
+            t = rclpy.time.Time.from_msg(msg.header.stamp)
+            self._last_cloud_stamp_ns = t.nanoseconds
+        except Exception:
+            self._last_cloud_stamp_ns = self.get_clock().now().nanoseconds
+        # debug: count + age (throttled ~1 Hz)
+        self._cloud_rx_count += 1
+        now_ns = self.get_clock().now().nanoseconds
+        age_s = (now_ns - self._last_cloud_stamp_ns) / 1e9
+        if now_ns - self._last_age_log_ns > 1e9:
+            # self.get_logger().info(f"[DBG] cloud_rx={self._cloud_rx_count} | age={age_s:.3f}s | use_sim_time={self.get_parameter('use_sim_time').get_parameter_value().bool_value}")
+            self._last_age_log_ns = now_ns
+
+    def _is_cloud_fresh(self, max_age_s: float = None) -> bool:
+        if max_age_s is None:
+            max_age_s = self.stale_cloud_s  # Runtime pe set karo
+        
+        if getattr(self, "_last_cloud_stamp_ns", None) is None:
+            return False
+        age_ns = self.get_clock().now().nanoseconds - self._last_cloud_stamp_ns
+        return age_ns <= int(max_age_s * 1e9)
 
 
     # ------------------- FAILURE TF REPORT -------------------
@@ -795,8 +1151,9 @@ class LStarObstacleChecker(Node):
         # Extra hints
         if cloud_age_s is not None:
             self.get_logger().warn(f"[TF] Cloud age: {cloud_age_s:.2f}s | stale_cloud_sec={self.stale_cloud_s:.2f}. If age > stale, raise stale_cloud_sec during startup.")
-        use_sim = self.get_parameter('use_sim_time').get_parameter_value().bool_value if self.has_parameter('use_sim_time') else False
-        self.get_logger().warn(f"[TF] use_sim_time={use_sim}. Ensure all nodes share same clock (gazebo/sim vs real).")
+        # use_sim = self.get_parameter('use_sim_time').get_parameter_value().bool_value if self.has_parameter('use_sim_time') else False
+        use_sim_time = True
+        self.get_logger().warn(f"[TF] use_sim_time={use_sim_time}. Ensure all nodes share same clock (gazebo/sim vs real).")
 
 
     # ------------------- Helper: publish ROI marker -------------------
@@ -983,7 +1340,10 @@ class LStarObstacleChecker(Node):
         # ---- 0) Draw ROI marker (your existing helper) ----
         try:
             self._publish_roi_marker(cx, cy, L, W, yaw_rad, color=(0.9, 0.8, 0.1, 0.35))
+            self.get_logger().info(f"[DEBUG] Published ROI marker at ({cx:.2f},{cy:.2f}) L={L:.2f} W={W:.2f} yaw={math.degrees(yaw_rad):.1f}°")
+            self.get_logger().debug("[DEBUG] Published ROI marker.")
         except Exception:
+            self.get_logger().warn("No helper for ROI marker publishing.")
             pass
 
         # ---- 1) Transform points to ROI local frame (de-rotate by yaw) ----
@@ -1023,8 +1383,10 @@ class LStarObstacleChecker(Node):
         # ---- 4) Publish ROI-inside points (blue) if your helper exists ----
         try:
             self._publish_inside_points(P_map, inside, color=(0.0, 0.5, 1.0, 0.9), max_points=5000)
+            self.get_logger().info(f"[DEBUG] Published {int(np.count_nonzero(inside))} inside points (blue).")
         except Exception:
             # minimal inline publisher (optional): ignore if you already have helper
+            self.get_logger().warn("No helper for inside points publishing.")
             pass
 
 
@@ -1035,11 +1397,14 @@ class LStarObstacleChecker(Node):
         # red debug publish if your helper exists
         try:
             self._publish_obstacle_points(P_map, inside, self.z_free_max, color=(1.0, 0.0, 0.0, 1.0), max_points=5000)
+            self.get_logger().info(f"[DEBUG] Published {obst_pts} obstacle points (red).")
         except Exception:
             pass
 
         # ---- 6) Visibility metric (grid coverage) ----
         roi_pts = int(np.count_nonzero(inside)) #how many points are inside the ROI
+        grid = np.zeros((grid_nx, grid_ny), dtype=bool)
+
 
         observed_cells = 0
         vis_ratio = 0.0
@@ -1054,10 +1419,11 @@ class LStarObstacleChecker(Node):
                 grid = np.zeros((grid_nx, grid_ny), dtype=bool)
                 grid[bx, by] = True
                 observed_cells = int(grid.sum())
-                vis_ratio = float(observed_cells) / float(grid_nx * grid_ny)
+                vis_ratio = float(observed_cells) / float(grid_nx * grid_ny)    
         except Exception:
             observed_cells = 0
             vis_ratio = 0.0
+            self.get_logger().warn("Failed to compute visibility metric.")
 
         # return roi_pts, observed_cells, vis_ratio, obst_pts
         return roi_pts, observed_cells, vis_ratio, obst_pts, (xp, yp, inside, grid)
@@ -1093,7 +1459,7 @@ def main():
     rclpy.init()
     node = LStarObstacleChecker()
     try:
-        executor = MultiThreadedExecutor(num_threads=2)  # 2 ya 4 bhi rakh sakte ho
+        executor = MultiThreadedExecutor(num_threads=4)  # 2 ya 4 bhi rakh sakte ho
         executor.add_node(node)
         executor.spin()
     except KeyboardInterrupt:
