@@ -51,7 +51,6 @@ from shape_msgs.msg import SolidPrimitive
 
 # ---------- Small math helpers ----------
 def quat_to_rotm(qx, qy, qz, qw) -> np.ndarray:
-    """Quaternion (xyzw) -> 3x3 rotation matrix."""
     x, y, z, w = qx, qy, qz, qw
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
@@ -67,7 +66,6 @@ def quat_to_rotm(qx, qy, qz, qw) -> np.ndarray:
 
 
 def tf_to_matrix(tf: TransformStamped) -> np.ndarray:
-    """TransformStamped -> 4x4 homogeneous transform (parent <- child)."""
     t = tf.transform.translation
     r = tf.transform.rotation
     R = quat_to_rotm(r.x, r.y, r.z, r.w)
@@ -78,7 +76,6 @@ def tf_to_matrix(tf: TransformStamped) -> np.ndarray:
 
 
 def rotm_to_quat_xyzw(Rm: np.ndarray):
-    """3x3 rotation matrix -> quaternion (x,y,z,w)."""
     m = np.array(Rm, dtype=float)
     t = np.trace(m)
     if t > 0.0:
@@ -185,6 +182,9 @@ class LStarObstacleChecker(Node):
         self._cov_grid = None
         self._cov_meta = None
 
+        # Obstacle memory (NEW)
+        self._obst_detected = False
+
         # Cloud subscriber
         self._last_cloud_msg: Optional[PointCloud2] = None
         self._last_cloud_stamp_ns: Optional[int] = None
@@ -207,11 +207,8 @@ class LStarObstacleChecker(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ===== Availability/stability primitives =====
-        # Steady (monotonic) clock for timer & deadlines (sim-time independent)
         self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
-        # Signal to unblock service after job finishes (success/failure/timeout)
         self._job_done_evt: Event = Event()
-        # Protect MoveIt futures from concurrent timer calls
         self._move_lock = Lock()
         self._move_goal_active = False
 
@@ -396,7 +393,6 @@ class LStarObstacleChecker(Node):
         return True
 
     def _moveit_motion_done(self) -> bool:
-        # Thread-safe, idempotent goal lifecycle
         with self._move_lock:
             if not self._move_goal_active:
                 return False
@@ -404,11 +400,9 @@ class LStarObstacleChecker(Node):
             mf = getattr(self, "_move_future", None)
             rf = getattr(self, "_result_future", None)
 
-            # waiting for goal acceptance
             if mf is not None and not mf.done():
                 return False
 
-            # got goal_handle, request result if not yet requested
             if mf is not None and mf.done() and rf is None:
                 goal_handle = mf.result()
                 if not goal_handle.accepted:
@@ -421,7 +415,6 @@ class LStarObstacleChecker(Node):
                 self.get_logger().info("[MOVE] Goal accepted; waiting for result...")
                 return False
 
-            # check result
             rf = getattr(self, "_result_future", None)
             if rf is not None and not rf.done():
                 return False
@@ -490,21 +483,18 @@ class LStarObstacleChecker(Node):
     def _eval_roi(self, P_map, cx, cy, L, W, yaw_rad):
         """
         Returns roi_pts, observed_cells, vis_ratio, obst_pts, (xp, yp, inside, grid)
-        - ROI in local frame (aligned with axes)
-        - Exclude box footprint
-        - Obstacle = z > z_free_max
-        - Visibility via cell coverage with grid_cell_m resolution
+        Obstacle = z > z_free_max (and outside box footprint)
         """
-        fp_margin = 0.15  # 15 cm footprint dilation
+        fp_margin = 0.15
         cell = max(1e-3, float(self.grid_cell_m))
         grid_nx = max(1, int(math.ceil(float(L) / cell)))
         grid_ny = max(1, int(math.ceil(float(W) / cell)))
 
         if P_map is None or P_map.shape[0] == 0:
             self.get_logger().warn("[FAILURE] No valid points found in transformed cloud.")
-            return 0, 0, 0.0, 0
+            return 0, 0, 0.0, 0, None
 
-        # ROI marker (thin slab)
+        # ROI marker
         self._publish_roi_marker(cx, cy, L, W, yaw_rad, color=(0.9, 0.8, 0.1, 0.35))
 
         # World -> ROI-local
@@ -519,7 +509,7 @@ class LStarObstacleChecker(Node):
         halfW = 0.5 * float(W)
         inside_roi = (np.abs(xp) < halfL) & (np.abs(yp) < halfW)
 
-        # Exclude box footprint (map-aligned rectangle)
+        # Exclude box footprint (map-aligned)
         try:
             box_cx, box_cy, box_L, box_W = self._box_fp
         except Exception:
@@ -560,11 +550,17 @@ class LStarObstacleChecker(Node):
         return (xw, yw)
 
     def _compute_roi_coverage(self, Pm):
+        """
+        Returns:
+          coverage_sim: float in [0,1]
+          next_xy_map:  np.array([x,y]) or None
+          obst_pts:     int (obstacle points inside ROI excluding footprint)
+        """
         if Pm is None or Pm.size == 0:
             if getattr(self, "_cov_grid", None) is not None:
                 cov = float(self._cov_grid.sum()) / float(self._cov_grid.size)
-                return cov, None
-            return 0.0, None
+                return cov, None, 0
+            return 0.0, None, 0
 
         cx, cy, L, W = self._roi_rect
         yaw_rad = self._roi_yaw
@@ -624,7 +620,7 @@ class LStarObstacleChecker(Node):
         else:
             next_xy_map = None
 
-        return float(coverage_sim), next_xy_map
+        return float(coverage_sim), next_xy_map, int(obst_pts)
 
     # ---------- Markers ----------
     def _publish_roi_marker(self, cx, cy, L, W, yaw_rad, color=(0.9, 0.8, 0.1, 0.35)):
@@ -654,12 +650,10 @@ class LStarObstacleChecker(Node):
 
     def _publish_inside_points(self, P_map, inside, color=(0.1, 0.6, 1.0, 0.9), max_points=5000):
         from geometry_msgs.msg import Point
-
         pts = P_map[inside]
         if pts.shape[0] > max_points:
             idx = np.random.choice(pts.shape[0], max_points, replace=False)
             pts = pts[idx]
-
         m = Marker()
         m.header.frame_id = self.target_frame
         m.header.stamp = self.get_clock().now().to_msg()
@@ -675,13 +669,11 @@ class LStarObstacleChecker(Node):
 
     def _publish_obstacle_points(self, P_map, inside, z_thresh, color=(1.0, 0.0, 0.0, 1.0), max_points=5000):
         from geometry_msgs.msg import Point
-
         obst_mask = inside & (P_map[:, 2] > float(z_thresh))
         pts = P_map[obst_mask]
         if pts.shape[0] > max_points:
             idx = np.random.choice(pts.shape[0], max_points, replace=False)
             pts = pts[idx]
-
         m = Marker()
         m.header.frame_id = self.target_frame
         m.header.stamp = self.get_clock().now().to_msg()
@@ -736,9 +728,12 @@ class LStarObstacleChecker(Node):
             self._move_goal_active = False
 
     def _finish_success(self, coverage: float):
-        blocked = (coverage < self.vis_ok_thresh)
-        self._last_result_blocked = bool(blocked)
-        self.get_logger().info(f"[RESULT] coverage={coverage*100:.1f}% -> obstacle_present={blocked}")
+        # DECISION: obstacle present if seen OR insufficient coverage
+        blocked = bool(self._obst_detected) or (coverage < float(self.vis_ok_thresh))
+        self._last_result_blocked = blocked
+        self.get_logger().info(
+            f"[RESULT] coverage={coverage*100:.1f}% obst_detected={self._obst_detected} -> obstacle_present={blocked}"
+        )
         self._reset_motion_handles()
         self._job_active = False
         self._job_state = "IDLE"
@@ -789,27 +784,40 @@ class LStarObstacleChecker(Node):
         if not self._is_cloud_fresh(self.stale_cloud_s):
             age_s = (self.get_clock().now().nanoseconds - (self._last_cloud_stamp_ns or 0)) / 1e9
             self.get_logger().warn(f"[CHECK] No fresh cloud | age={age_s:.3f}s (limit={self.stale_cloud_s:.2f}s)")
-            return False, None, None
+            return False, None, None, 0
 
         Pm = self._get_cloud_in_map_nonblocking()
-        cov, centroid = self._compute_roi_coverage(Pm)
+        cov, centroid, obst_pts = self._compute_roi_coverage(Pm)
+
+        # Update obstacle flag
+        if int(obst_pts) >= int(self.min_obst_pts):
+            if not self._obst_detected:
+                self.get_logger().warn(f"[OBST] Detected {obst_pts} pts (>={self.min_obst_pts}) in ROI.")
+            self._obst_detected = True
+
         self.get_logger().info(
-            f"[ITER] coverage={cov*100:.1f}% | next_xy={None if centroid is None else tuple(np.round(centroid, 3))}"
+            f"[ITER] coverage={cov*100:.1f}% | obst_pts={obst_pts} | next_xy={None if centroid is None else tuple(np.round(centroid, 3))}"
         )
         roi_marker = self._make_roi_marker(Pm, cov)
         self.marker_pub.publish(roi_marker)
 
-        if cov >= 0.90 or self._job_cancel:
+        # Early stop if obstacle confirmed and we have minimum confidence
+        if self._obst_detected and cov >= float(self.vis_min_thresh):
+            self.get_logger().info(
+                f"[CHECK] Early stop: obstacle observed and coverage >= vis_min_thresh ({self.vis_min_thresh*100:.1f}%)"
+            )
+            return True, cov, None, obst_pts
+
+        if cov >= float(self.stop_cov_thresh) or self._job_cancel:
             self.get_logger().info(f"[CHECK] DONE: coverage={cov*100:.1f}%")
-            return True, cov, None
-        else:
-            return True, cov, centroid
+            return True, cov, None, obst_pts
+
+        return True, cov, centroid, obst_pts
 
     # ---------- State machine tick ----------
     def _process_job_tick(self):
         self._tick_count += 1
 
-        # Debug heartbeat (uses ROS time for stamping logs; fine)
         now_ns = self.get_clock().now().nanoseconds
         if now_ns - self._last_tick_log_ns > 2e9:
             self.get_logger().info(f"[DBG] tick={self._tick_count} state={self._job_state}")
@@ -818,7 +826,6 @@ class LStarObstacleChecker(Node):
         if not self._job_active:
             return
 
-        # Deadline check against monotonic (steady) time
         if time.monotonic() >= getattr(self, "_job_deadline_monotonic", float("inf")):
             self.get_logger().warn("[JOB] deadline reached (monotonic)")
             self._finish_failure()
@@ -836,19 +843,16 @@ class LStarObstacleChecker(Node):
                 return
 
             if self._job_state == "ITERATE":
-                step_done, coverage, next_xy = self._iterate_once()
+                step_done, coverage, next_xy, obst_pts = self._iterate_once()
                 if not step_done:
                     self.get_logger().warn("[CHECK] Waiting for fresh cloud...")
                     return
-                if coverage is not None and coverage >= self.stop_cov_thresh:
-                    self.get_logger().info(
-                        f"[CHECK] Reached stop_cov_thresh={self.stop_cov_thresh*100:.1f}% -> finishing"
-                    )
+
+                # If early stop condition met
+                if next_xy is None:
                     self._finish_success(coverage)
                     return
-                if next_xy is None:
-                    self._finish_failure()
-                    return
+
                 self._schedule_orient_to_point(next_xy)
                 self._job_state = "WAIT_STEP_ORIENT"
                 return
@@ -878,13 +882,13 @@ class LStarObstacleChecker(Node):
         self._reset_motion_handles()
         self._last_result_blocked = True
         self._job_done_evt.clear()
+        self._obst_detected = False  # reset obstacle flag
 
         self._job_active = True
         self._job_cancel = False
         self._job_state = "INIT"
         self._job_req = req
 
-        # Use monotonic deadline (sim-time independent)
         self._job_deadline_monotonic = time.monotonic() + float(req.duration_sec)
 
         try:
@@ -915,8 +919,8 @@ class LStarObstacleChecker(Node):
             float(self.grid_cell_m),
         )
 
-        # ---- NO nested spinning: just wait for completion signal ----
-        hard_timeout_s = float(req.duration_sec) + 3.0  # cushion for MoveIt/TF
+        # NO nested spinning
+        hard_timeout_s = float(req.duration_sec) + 3.0
         self._job_done_evt.wait(timeout=hard_timeout_s)
         self._job_done_evt.clear()
 
@@ -936,7 +940,7 @@ def main():
     rclpy.init()
     node = LStarObstacleChecker()
     try:
-        executor = MultiThreadedExecutor(num_threads=2)
+        executor = MultiThreadedExecutor(num_threads=4)
         executor.add_node(node)
         executor.spin()
     except KeyboardInterrupt:
