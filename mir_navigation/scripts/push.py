@@ -106,6 +106,7 @@ class PushOrchestrator(Node):
         self.declare_parameter('global_costmap_topic', '/global_costmap/costmap')
         self.declare_parameter('lethal_threshold', 253)
         self.declare_parameter('treat_unknown_as_blocked', True)
+        self.declare_parameter('premanip_reach_timeout_s', 60.0)
 
         self.declare_parameter('robot_length', 0.90)
         self.declare_parameter('robot_width',  0.50)
@@ -395,9 +396,13 @@ class PushOrchestrator(Node):
         self.get_logger().info("[NAV] Goal accepted ✅")
         return gh
 
-    def _wait_nav_result(self, goal_handle) -> Optional[int]:
-        """Wait for execution result up to nav_result_timeout_s using a robust wall-clock loop."""
-        T = float(self.get_parameter('nav_result_timeout_s').get_parameter_value().double_value)
+    def _wait_nav_result(self, goal_handle, timeout_s: float | None = None) -> Optional[int]:
+        """
+        Wait for NavigateToPose result.
+        If timeout_s is given, use that; otherwise use param 'nav_result_timeout_s'.
+        """
+        T = float(timeout_s if timeout_s is not None
+                else self.get_parameter('nav_result_timeout_s').get_parameter_value().double_value)
         result_future = goal_handle.get_result_async()
 
         t0 = time.monotonic()
@@ -418,7 +423,6 @@ class PushOrchestrator(Node):
                 self.get_logger().warn(f"[NAV] Result wait timeout (> {T:.1f}s). Canceling.")
                 try:
                     cancel_future = goal_handle.cancel_goal_async()
-                    # wait briefly for cancel to settle to avoid races with next goal
                     t_cancel0 = time.monotonic()
                     while rclpy.ok() and not cancel_future.done() and (time.monotonic() - t_cancel0) < 2.0:
                         rclpy.spin_once(self, timeout_sec=0.05)
@@ -426,8 +430,8 @@ class PushOrchestrator(Node):
                     self.get_logger().warn(f"[NAV] Cancel request error: {e}")
                 return None
 
-        # Node shutting down
-        return None
+        return None  # shutting down
+
 
     def _publish_vx(self, v: float):
         msg = Twist(); msg.linear.x = v; msg.angular.z = 0.0
@@ -442,9 +446,9 @@ class PushOrchestrator(Node):
 
     def _go_side_peek_obstacle_side(self,
                                 plan_dir: str,
-                                reach_wait_s: float = 15.0,
+                                reach_wait_s: float = 60.0,
                                 peek_forward: float = 0.25,
-                                extra_buffer_m: float = None) -> bool:
+                                extra_buffer_m: float = 0.25) -> bool:
         """
         Make two NAV goals *anchored at the obstacle side* (not robot side):
         1) Anchor = box center nudged 'peek_forward' along push direction
@@ -587,11 +591,6 @@ class PushOrchestrator(Node):
             xf, xb, yr, yl = self._robot_extremes(rx, ry, ryaw)
             xmin, xmax, ymin, ymax = self._box_extents()
             gap = self._gap_to_contact(plan_dir, xf, xb, yl, yr, xmin, xmax, ymin, ymax)
-            # self.get_logger().info(f"[DEBUG] Robot pose: rx={rx:.3f}, ry={ry:.3f}, ryaw={math.degrees(ryaw):.1f}deg")
-            # self.get_logger().info(f"[DEBUG] Robot extremes: xb={xb:.3f}, xf={xf:.3f}, yr={yr:.3f}, yl={yl:.3f}")
-            # self.get_logger().info(f"[DEBUG] Box extents: xmin={xmin:.3f}, xmax={xmax:.3f}, ymin={ymin:.3f}, ymax={ymax:.3f}")
-            # self.get_logger().info(f"[DEBUG] Gap calculation: xmin-xf = {xmin:.3f} - {xf:.3f} = {gap:.3f}")
-
             # ---- Velocity drop ratio normalized by *approach_v* ----
             current_cmd = max(approach_v, 1e-3)
             ratio = self.odom_vx_filt / current_cmd
@@ -794,160 +793,6 @@ class PushOrchestrator(Node):
             time.sleep(dt)
 
 
-
-    # def _correct_orientation_inplace(self, plan_dir: str) -> bool:
-    #     """
-    #     Simple closed-loop: keep rotating in place until yaw ≈ target.
-    #     No extra parameters; hardcoded small tolerance & speeds.
-    #     """
-
-    #     try:
-    #         tf = self.tf_buffer.lookup_transform('map', 'odom', rclpy.time.Time())  # map <- odom
-    #     except Exception as ex:
-    #         self.get_logger().warn(f"[ORIENT] TF lookup failed map<-odom: {ex}")
-    #         return False
-
-    #     # target yaw from your existing helper
-    #     _, yaw_ref = self._dir_unit_and_yaw(plan_dir)
-
-    #     # local helper to wrap angle to [-pi, pi]
-    #     def wrap(a: float) -> float:
-    #         return math.atan2(math.sin(a), math.cos(a))
-
-    #     # choose pose source (prefer odom if available)
-    #     pose = self.odom_pose if self.odom_pose is not None else self.robot_pose
-    #     if pose is None:
-    #         self.get_logger().warn("[ORIENT] No pose available.")
-    #         return False
-        
-    #     tol = math.radians(0.2)   # 0.2°
-    #     kp  = 0.2
-    #     w_max = 0.5
-    #     w_min = 0.08
-
-    #     # entry log
-    #     self.get_logger().info(
-    #         f"[ORIENT] start dir={plan_dir} | yaw_ref={math.degrees(yaw_ref):.2f}deg "
-    #         f"| tol={math.degrees(tol):.2f}deg kp={kp:.2f} w_max={w_max:.2f} w_min={w_min:.2f} src={'ODOM' if self.odom_pose is not None else 'MAP'}"
-    #     )
-
-    #     t0 = time.monotonic()
-    #     timeout_s = 15.0
-    #     dt = 0.03
-    #     tick = 0
-
-    #     while True:
-    #         pose = self.odom_pose if self.odom_pose is not None else self.robot_pose
-    #         if pose is None:
-    #             self.cmd_pub.publish(Twist())
-    #             self.get_logger().warn("[ORIENT] pose lost → abort.")
-    #             return False
-
-    #         # get fresh map<-odom each tick (AMCL may update this)
-    #         try:
-    #             tf = self.tf_buffer.lookup_transform('map', 'odom', rclpy.time.Time())
-    #             q = tf.transform.rotation  # xyzw
-    #             yaw_off = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
-    #         except Exception as ex:
-    #             self.get_logger().warn(f"[ORIENT] TF lookup failed: {ex}")
-    #             yaw_off = 0.0  # fail-safe 
- 
-    #         # compute yaw_now in /map
-    #         if self.odom_pose is not None:
-    #             odom_yaw = self.odom_pose[2]
-    #             yaw_now  = (odom_yaw + yaw_off + math.pi) % (2*math.pi) - math.pi
-    #         else:
-    #             # pose is already in /map
-    #             yaw_now = pose[2]
-
-    #         e = wrap(yaw_ref - yaw_now)
-
-    #         if abs(e) <= tol:
-    #             self.cmd_pub.publish(Twist())
-    #             self.get_logger().info(f"[ORIENT] aligned | final_err={math.degrees(e):.2f}deg | t={(time.monotonic()-t0):.2f}s")
-    #             return True
-
-    #         w_raw = kp * e
-    #         clipped = abs(w_raw) > w_max
-    #         w = max(min(w_raw, w_max), -w_max)
-    #         hit_min = abs(w) < w_min
-    #         if hit_min:
-    #             w = math.copysign(w_min, w)
-
-    #         cmd = Twist(); cmd.angular.z = w
-    #         self.cmd_pub.publish(cmd)
-
-    #         if tick % 3 == 0:
-    #             self.get_logger().info(
-    #                 f"[ORIENT] yaw={math.degrees(yaw_now):.2f}deg "
-    #                 f"err={math.degrees(e):.2f}deg w_cmd={w:.3f} "
-    #                 f"clip={clipped} min={hit_min}"
-    #             )
-    #         tick += 1 
-
-    #         try:
-    #             rclpy.spin_once(self, timeout_sec=0.01)
-    #         except Exception:
-    #             pass
-    #         time.sleep(dt)
-
-    #         # watchdog
-    #         if (time.monotonic() - t0) > timeout_s:
-    #             self.cmd_pub.publish(Twist())
-    #             self.get_logger().warn(f"[ORIENT] timeout {timeout_s:.1f}s; last_err={math.degrees(e):.2f}deg")
-    #             return False
-
-        # tol = math.radians(0.2)   # ~2°
-        # kp  = 0.2                 # simple proportional
-        # w_max = 0.5               # rad/s cap
-        # w_min = 0.08              # minimum to break static friction
-
-        # t0 = time.monotonic()
-        # timeout_s = 15.0
-        # dt = 0.03                 # ~33 Hz
-
-        # while True:
-        #     # refresh latest yaw
-        #     pose = self.odom_pose if self.odom_pose is not None else self.robot_pose
-        #     if pose is None:
-        #         # stop and fail gracefully
-        #         z = Twist(); self.cmd_pub.publish(z)
-        #         return False
-
-        #     yaw_now = pose[2]
-        #     e = wrap(yaw_ref - yaw_now)
-
-        #     # done?
-        #     if abs(e) <= tol:
-        #         z = Twist()  # stop
-        #         self.cmd_pub.publish(z)
-        #         return True
-
-        #     # simple P -> omega, with clamp + minimum magnitude
-        #     w = kp * e
-        #     if w >  w_max: w =  w_max
-        #     if w < -w_max: w = -w_max
-        #     if abs(w) < w_min:
-        #         w = math.copysign(w_min, w)
-
-        #     cmd = Twist()
-        #     cmd.linear.x = 0.0
-        #     cmd.angular.z = w
-        #     self.cmd_pub.publish(cmd)
-
-        #     # let callbacks run a bit & pace the loop
-        #     try:
-        #         rclpy.spin_once(self, timeout_sec=1.0)
-        #     except Exception:
-        #         pass
-        #     time.sleep(dt)
-
-            # # simple watchdog
-            # if (time.monotonic() - t0) > timeout_s:
-            #     z = Twist(); self.cmd_pub.publish(z)
-            #     self.get_logger().warn("[ORIENT] Timeout; aborting.")
-            #     return False
-            
 
 
     def _do_push_from_contact(self, plan_dir: str, K: float, s_origin: float, cap: float) -> bool:
@@ -1152,7 +997,11 @@ class PushOrchestrator(Node):
                 self.get_logger().info("[NAV] Acceptance failed. Trying next direction.")
                 continue
 
-            status = self._wait_nav_result(gh)
+            T_pre = float(self.get_parameter('premanip_reach_timeout_s').get_parameter_value().double_value)
+            status = self._wait_nav_result(gh, timeout_s=T_pre)
+
+
+
             if status != GoalStatus.STATUS_SUCCEEDED:
                 self.get_logger().warn(f"[NAV] Navigation failed (status={status}). Trying next direction.")
                 continue
@@ -1207,7 +1056,7 @@ class PushOrchestrator(Node):
                 continue
             if blocked:
                 self.get_logger().info("[PUSH] Path BLOCKED → skipping this direction.")
-                break
+                continue
 
             self.get_logger().info("[PUSH] Path CLEAR → proceeding to push sequence.")
 
