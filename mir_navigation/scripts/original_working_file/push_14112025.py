@@ -81,6 +81,13 @@ class PushOrchestrator(Node):
     def __init__(self):
         super().__init__('push_orchestrator_nav2')
 
+
+        
+        self.declare_parameter('corridor_debug_topic', '/corridor_debug')
+        corr_topic = self.get_parameter('corridor_debug_topic').get_parameter_value().string_value
+        self.corridor_pub = self.create_publisher(MarkerArray, corr_topic, 10)
+
+
         # ---- RViz L* viz params/publisher ----
         self.declare_parameter('viz_enabled', True)
         self.declare_parameter('viz_topic', '/lstar_viz')
@@ -93,6 +100,9 @@ class PushOrchestrator(Node):
         self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        self.declare_parameter('debug_corridor', True)
+
+
         # Service clients
         self.vis_cli = self.create_client(VisibilityCheck, '/lstar/check_area')
         for _ in range(30):  # ~3 sec wait
@@ -104,7 +114,7 @@ class PushOrchestrator(Node):
 
         # Params
         self.declare_parameter('global_costmap_topic', '/global_costmap/costmap')
-        self.declare_parameter('lethal_threshold', 253)
+        self.declare_parameter('lethal_threshold', 150)
         self.declare_parameter('treat_unknown_as_blocked', True)
         self.declare_parameter('premanip_reach_timeout_s', 60.0)
 
@@ -112,6 +122,8 @@ class PushOrchestrator(Node):
         self.declare_parameter('robot_width',  0.50)
         self.declare_parameter('buffer_m',     0.10)
         self.declare_parameter('dir_order', ['+X','-X','+Y','-Y'])
+        # self.declare_parameter('dir_order', ['+Y','-Y','+X','-X'])
+
 
         self.declare_parameter('standoff_m',   0.50)
         self.declare_parameter('contact_gap_m',0.06)
@@ -224,28 +236,135 @@ class PushOrchestrator(Node):
     def _occ_bool(self):
         leth = int(self.get_parameter('lethal_threshold').get_parameter_value().integer_value)
         occ = (self.grid >= leth)
+
         if self.get_parameter('treat_unknown_as_blocked').get_parameter_value().bool_value:
             occ = np.logical_or(occ, (self.grid == 255) | (self.grid < 0))
+
+        # DEBUG: thoda info
+        if self.get_parameter('debug_corridor').get_parameter_value().bool_value:
+            blocked = int(np.count_nonzero(occ))
+            total = int(occ.size)
+            self.get_logger().info(
+                f"[DBG] occ_bool: grid.shape={occ.shape}, blocked={blocked}/{total}, leth={leth}"
+            )
+
         return occ
+    
+    def _viz_corridor_debug(self, center, yaw, L, W, hit_cells):
+        # sirf jab viz + debug on ho
+        if not self.get_parameter('viz_enabled').get_parameter_value().bool_value:
+            return
+        if not self.get_parameter('debug_corridor').get_parameter_value().bool_value:
+            return
+        if self.grid is None or not hasattr(self, 'viz_pub'):
+            return
+
+        from visualization_msgs.msg import Marker, MarkerArray
+        from std_msgs.msg import ColorRGBA
+        from geometry_msgs.msg import Point
+
+        now = self.get_clock().now().to_msg()
+        arr = MarkerArray()
+        mid = 4000  # alag id range
+
+        # Corridor rectangle (green transparent)
+        m = Marker()
+        m.header.frame_id = self.info.header.frame_id if hasattr(self.info, 'header') else 'map'
+        m.header.stamp = now
+        m.ns = "corridor_dbg"
+        m.id = mid
+        m.type = Marker.CUBE
+        m.action = Marker.ADD
+        m.pose.position.x = center[0]
+        m.pose.position.y = center[1]
+        m.pose.orientation = quat_from_yaw(yaw)
+        m.scale.x = float(L)
+        m.scale.y = float(W)
+        m.scale.z = 0.03
+        m.color = ColorRGBA(r=0.1, g=0.8, b=0.1, a=0.3)
+        arr.markers.append(m)
+
+        # Agar obstacle cells mile to unko red dots se dikhao
+        if hit_cells:
+            mh = Marker()
+            mh.header.frame_id = m.header.frame_id
+            mh.header.stamp = now
+            mh.ns = "corridor_hits"
+            mh.id = mid + 1
+            mh.type = Marker.SPHERE_LIST
+            mh.action = Marker.ADD
+            mh.scale.x = mh.scale.y = mh.scale.z = 0.05
+            mh.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.9)
+            mh.points = []
+            for (x, y) in hit_cells:
+                p = Point()
+                p.x = float(x)
+                p.y = float(y)
+                p.z = 0.05
+                mh.points.append(p)
+            arr.markers.append(mh)
+
+        # self.viz_pub.publish(arr)
+        pub = getattr(self, 'corridor_pub', self.viz_pub)
+        pub.publish(arr)
+
 
     def _rect_free(self, occ, center, yaw, L, W) -> bool:
-        ox, oy, res = self.info.origin.position.x, self.info.origin.position.y, self.info.resolution
-        hL, hW = 0.5*L, 0.5*W
-        corners = [rot_local_to_world(center[0], center[1], yaw, sx, sy)
-                   for sx in (-hL, hL) for sy in (-hW, hW)]
-        xs = [c[0] for c in corners]; ys = [c[1] for c in corners]
+        ox  = self.info.origin.position.x
+        oy  = self.info.origin.position.y
+        res = self.info.resolution
+
+        hL, hW = 0.5 * L, 0.5 * W
+
+        # rectangle ke 4 corner world frame me
+        corners = [
+            rot_local_to_world(center[0], center[1], yaw, sx, sy)
+            for sx in (-hL, hL)
+            for sy in (-hW, hW)
+        ]
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+
+        # bounding box ko grid index me convert
         r0, c0 = world_to_cell(min(xs), min(ys), ox, oy, res)
         r1, c1 = world_to_cell(max(xs), max(ys), ox, oy, res)
+
         H, Wg = occ.shape
-        r0, r1 = max(0, min(H-1, r0)), max(0, min(H-1, r1))
-        c0, c1 = max(0, min(Wg-1, c0)), max(0, min(Wg-1, c1))
-        for r in range(min(r0,r1), max(r0,r1)+1):
-            for c in range(min(c0,c1), max(c0,c1)+1):
-                x, y = cell_center((r,c), ox, oy, res)
+        r0 = max(0, min(H - 1, r0))
+        r1 = max(0, min(H - 1, r1))
+        c0 = max(0, min(Wg - 1, c0))
+        c1 = max(0, min(Wg - 1, c1))
+
+        debug = self.get_parameter('debug_corridor').get_parameter_value().bool_value
+        hit_cells = []
+        hit = False
+
+        for r in range(min(r0, r1), max(r0, r1) + 1):
+            for c in range(min(c0, c1), max(c0, c1) + 1):
+                x, y = cell_center((r, c), ox, oy, res)
+
+                # sirf rectangle ke andar wale cells
                 if point_in_oriented_rect(x, y, center[0], center[1], yaw, hL, hW):
                     if occ[r, c]:
-                        return False
+                        if debug:
+                            hit = True
+                            hit_cells.append((x, y))
+                        else:
+                            # normal fast path
+                            return False
+
+        if debug:
+            # RViz + console me batao kya mila
+            self._viz_corridor_debug(center, yaw, L, W, hit_cells)
+            state = "FREE" if not hit_cells else f"BLOCKED ({len(hit_cells)} hits)"
+            self.get_logger().info(
+                f"[DBG] _rect_free center=({center[0]:.2f},{center[1]:.2f}) "
+                f"yaw={math.degrees(yaw):.1f}deg L={L:.2f} W={W:.2f} -> {state}"
+            )
+            return not hit
+
         return True
+
     
     
     def _viz_clear(self):
@@ -579,10 +698,10 @@ class PushOrchestrator(Node):
                 center=(self.box['x'], ymax+0.5*K); yaw=math.pi/2.0;W=self.robot_L
             else:  # '-Y'
                 center=(self.box['x'], ymin-0.5*K); yaw=-math.pi/2.0;W=self.robot_L
-            if not self._rect_free(occ, center, yaw, K, W):
-                self._stop()
-                self.get_logger().warn("[PUSH] Corridor blocked during approach. Abort.")
-                return False, None, None
+            # if not self._rect_free(occ, center, yaw, K, W):
+            #     self._stop()
+            #     self.get_logger().warn("[PUSH] Corridor blocked during approach. Abort.")
+            #     return False, None, None
 
             # ---- Use ODOM pose for proximity during approach (more responsive than AMCL) ----
             pose_src = self.odom_pose if self.odom_pose is not None else self.robot_pose
@@ -671,7 +790,10 @@ class PushOrchestrator(Node):
         if self.grid is None or self.robot_pose is None:
             return None
         occ = self._occ_bool()
-        rx, ry, ryaw = self.robot_pose
+        if self.odom_pose is not None:
+            rx, ry, ryaw = self.odom_pose   # same source as progress
+        else:
+            rx, ry, ryaw = self.robot_pose  # fallback
         x_back, x_front, y_right, y_left = self._robot_extremes(rx, ry, ryaw)
         xmin, xmax, ymin, ymax = self._box_extents()
 
@@ -802,6 +924,9 @@ class PushOrchestrator(Node):
         - Active zero-hold braking on stop
         - L* computed against a 'virtual box' that moves with progress so it monotonically decreases
         """
+
+        last_Ls = float('inf')
+
         # Preconditions
         if self.robot_pose is None or self.odom_pose is None:
             self.get_logger().warn("[PUSH] Missing robot/odom pose.")
@@ -842,10 +967,10 @@ class PushOrchestrator(Node):
                 center=(self.box['x'], ymax+0.5*K); yaw=math.pi/2.0; W=self.robot_L
             else:  # '-Y'
                 center=(self.box['x'], ymin-0.5*K); yaw=-math.pi/2.0; W=self.robot_L
-            if not self._rect_free(occ, center, yaw, K, W):
-                self._stop()
-                self.get_logger().warn("[PUSH] Corridor blocked → abort.")
-                return False
+            # if not self._rect_free(occ, center, yaw, K, W):
+            #     self._stop()
+            #     self.get_logger().warn("[PUSH] Corridor blocked → abort.")
+            #     return False
 
             # Progress from contact (ODOM projection along plan_dir)
             ox, oy = self.odom_pose[0], self.odom_pose[1]
@@ -868,6 +993,11 @@ class PushOrchestrator(Node):
             xf, xb, yr, yl = self._robot_extremes(rx, ry, ryaw)
             Ls_now = self._recompute_Lstar(plan_dir, K, buf, xf, xb, yl, yr,
                                         xmin_v, xmax_v, ymin_v, ymax_v)
+            
+            if last_Ls < float('inf'):
+                Ls_now = min(Ls_now, last_Ls)
+            last_Ls = Ls_now
+
 
             # Early-clear gate: if L* <= 0, stop with brake and finish
             if Ls_now <= 0.0:
@@ -987,11 +1117,13 @@ class PushOrchestrator(Node):
         # NAV (try chosen first, then cycle others on accept failure / result failure)
         start_idx = self.dir_order.index(plan['dir'])
         for off in range(len(self.dir_order)):
-            dtag = self.dir_order[(start_idx + off) % len(self.dir_order)]
-            x,y,yaw = self._premanip_pose(dtag)
-            self.get_logger().info(f"[NAV] Trying {dtag} pre-manip: ({x:.2f},{y:.2f},{math.degrees(yaw):.1f}deg)")
-            goal = self._build_nav_goal(x,y,yaw)
+            push_dir = self.dir_order[(start_idx + off) % len(self.dir_order)]
 
+            x, y, yaw = self._premanip_pose(push_dir)
+            self.get_logger().info(
+                f"[NAV] Trying {push_dir} pre-manip: ({x:.2f},{y:.2f},{math.degrees(yaw):.1f}deg)"
+            )
+            goal = self._build_nav_goal(x, y, yaw)
             gh = self._send_and_wait_accept(goal)
             if gh is None:
                 self.get_logger().info("[NAV] Acceptance failed. Trying next direction.")
@@ -999,45 +1131,41 @@ class PushOrchestrator(Node):
 
             T_pre = float(self.get_parameter('premanip_reach_timeout_s').get_parameter_value().double_value)
             status = self._wait_nav_result(gh, timeout_s=T_pre)
-
-
-
             if status != GoalStatus.STATUS_SUCCEEDED:
                 self.get_logger().warn(f"[NAV] Navigation failed (status={status}). Trying next direction.")
                 continue
 
-            # (Yaw alignment check removed as requested)
-            self.get_logger().info(f"[NAV] Reached pre-manip for {dtag} ✅")
+            self.get_logger().info(f"[NAV] Reached pre-manip for {push_dir} ✅")
             pre_x, pre_y, pre_yaw = x, y, yaw
 
+            # ==== SCOUT ab current push_dir pe ====
             ok_view = self._go_side_peek_obstacle_side(
-                plan['dir'],            # chosen push direction
-                reach_wait_s=15.0,      # wait to *reach* each side for up to 15 s
-                peek_forward=0.25,      # nudge anchor slightly ahead of box face
-                extra_buffer_m=0.12     # keep robot outside the corridor edge
+                push_dir,
+                reach_wait_s=15.0,
+                peek_forward=0.25,
+                extra_buffer_m=0.12
             )
             if not ok_view:
                 self.get_logger().warn("[SCOUT] Side-peek both points failed → trying next direction.")
                 continue
 
-            #Visibility Check from camera
+            # ==== Visibility region bhi push_dir se ====
             box_cx = self.box['x']
             box_cy = self.box['y']
-            K = plan['K']
 
-            d = plan['dir']
-            if d == '+X':   ux, uy, yaw_deg =  1.0,  0.0,   0.0
-            elif d == '-X': ux, uy, yaw_deg = -1.0,  0.0, 180.0
-            elif d == '+Y': ux, uy, yaw_deg =  0.0,  1.0,  90.0
-            else:           ux, uy, yaw_deg =  0.0, -1.0, -90.0  # '-Y'
+            K = plan['K']  # ← ADD THIS LINE
 
-            # Determine corridor width based on direction
-            anchor_x = box_cx + 0.5 * self.box['L'] * ux #Anchor = box ka wo side centre jo push wali direction me hai.
+            if push_dir == '+X':   ux, uy, yaw_deg =  1.0,  0.0,   0.0
+            elif push_dir == '-X': ux, uy, yaw_deg = -1.0,  0.0, 180.0
+            elif push_dir == '+Y': ux, uy, yaw_deg =  0.0,  1.0,  90.0
+            else:                  ux, uy, yaw_deg =  0.0, -1.0, -90.0
+
+            anchor_x = box_cx + 0.5 * self.box['L'] * ux
             anchor_y = box_cy + 0.5 * self.box['W'] * uy
             region_cx = anchor_x + 0.5 * K * ux
             region_cy = anchor_y + 0.5 * K * uy
 
-            if d in ('+X','-X'):
+            if push_dir in ('+X','-X'):
                 corridor_width = max(self.robot_W, self.box['W'])
             else:
                 corridor_width = max(self.robot_L, self.box['L'])
@@ -1047,46 +1175,57 @@ class PushOrchestrator(Node):
                 L=K, W=corridor_width,
                 yaw_deg=yaw_deg,
                 dur_sec=120,
-                timeout_sec=120   # client wait >= service duration
+                timeout_sec=120
             )
 
             if blocked is None:
                 self.get_logger().warn("[PUSH] VisibilityCheck timeout/failed → treating as BLOCKED.")
-                # safe choice: skip this direction
                 continue
             if blocked:
                 self.get_logger().info("[PUSH] Path BLOCKED → skipping this direction.")
                 continue
 
             self.get_logger().info("[PUSH] Path CLEAR → proceeding to push sequence.")
+            try:
+                buf = float(self.get_parameter('buffer_m').get_parameter_value().double_value)
+                if self.robot_pose is not None:
+                    rx, ry, ryaw = self.robot_pose
+                    xf, xb, yr, yl = self._robot_extremes(rx, ry, ryaw)
+                    xmin, xmax, ymin, ymax = self._box_extents()
+                    Ls = self._recompute_Lstar(push_dir, K, buf, xf, xb, yl, yr, xmin, xmax, ymin, ymax)
+                    self._viz_selected_lstar(push_dir, Ls)
+            except Exception as e:
+                self.get_logger().warn(f"[VIZ] L* update failed: {e}")
 
-
-
-            # Return to pre-manip before starting approach
+            # Return to pre-manip
             goal_back = self._build_nav_goal(pre_x, pre_y, pre_yaw)
             gh_back   = self._send_and_wait_accept(goal_back)
             if gh_back is None or self._wait_nav_result(gh_back) != GoalStatus.STATUS_SUCCEEDED:
                 self.get_logger().warn("[NAV] Could not return to pre-manip. Trying next direction.")
                 continue
-                
-            # LOCK final direction and push
-            ok, s_origin, cap_from_contact = self._approach_contact(plan['dir'], plan['K'])
+
+            # ==== Approach + push bhi isi push_dir pe ====
+            ok, s_origin, cap_from_contact = self._approach_contact(push_dir, K)
             if not ok:
                 self.get_logger().warn("[PUSH] Could not confirm contact. Trying next direction.")
                 continue
-            # Use cap from contact recompute; fallback to plan cap if None
-            cap_final = cap_from_contact if cap_from_contact is not None else plan['cap']
-            ok = self._do_push_from_contact(plan['dir'], plan['K'], s_origin, cap_final)
+
+            cap_final = cap_from_contact if cap_from_contact is not None else (
+                self._recompute_Lstar(push_dir, K,
+                                    float(self.get_parameter('buffer_m').get_parameter_value().double_value),
+                                    *self._robot_extremes(*self.robot_pose),
+                                    *self._box_extents()) + 0.20
+            )
+
+            ok = self._do_push_from_contact(push_dir, K, s_origin, cap_final)
             if ok:
-                self._retract_from_contact(plan['dir'], backoff_m=0.5)
+                self._retract_from_contact(push_dir, backoff_m=0.5)
+                return
 
-            if not ok:
-                self.get_logger().warn("[PUSH] Push failed. Trying next direction.")
-                continue
-
-            return
+            self.get_logger().warn("[PUSH] Push failed. Trying next direction.")
 
         self.get_logger().warn("[NAV] All directions failed. ABORT.")
+
 
 
 # ---------- main ----------

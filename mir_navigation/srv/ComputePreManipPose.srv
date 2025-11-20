@@ -1,0 +1,13 @@
+# Request
+float32 box_x
+float32 box_y
+float32 box_l
+float32 box_w
+string dir
+
+---
+# Response
+bool   success
+float64 pre_x
+float64 pre_y
+float64 pre_yaw

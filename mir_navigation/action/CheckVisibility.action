@@ -1,0 +1,8 @@
+string obstacle_name 
+string vis_dir          
+float32 duration_sec    
+
+---
+bool obstacle_present  
+
+---

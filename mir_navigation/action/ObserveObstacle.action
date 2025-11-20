@@ -1,0 +1,14 @@
+# Goal
+string obstacle_name
+
+
+---
+# Result
+bool success
+string label
+string message
+
+
+---
+# Feedback
+string phase

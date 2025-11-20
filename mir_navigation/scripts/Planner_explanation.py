@@ -19,7 +19,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.executors import SingleThreadedExecutor   #SINGLE-THREADING for cleaner execution
 from rclpy.callback_groups import ReentrantCallbackGroup #Callback group for reentrant callbacks
 import threading # Import the threading library
-from mir_navigation.action import ManipulateBox
+from mir_navigation.action import ObserveObstacle, CheckVisibility, ManipulateObstacle
+from mir_navigation.srv import ComputeSidePeekPoints, ComputePreManipPose
+
 
 
 
@@ -167,116 +169,123 @@ class AOGModule:
             else:
                 arc.status = "PENDING"
     
-    def expand_graph_for_visibility(self, q_view, q_goal):
-        """Create a new graph for handling visibility"""
+    def expand_graph_for_visibility(self, obstacle):
+        """
+        Build the visibility sub-graph using the existing AOGGraph API.
+
+        N_OBSERVATION
+        --V0:NAVIGATE_TO_VIS_POINT-->  N_VIS_POINT
+        --V1:VISIBILITY_ACTION------->  N_VIS_DONE
+        """
         new_graph = AOGGraph()
-        
-        # Current configuration node
-        n_current = new_graph.add_node("N_CURRENT_CONFIG", node_type="config")
-        n_current.status = "ACHIEVED"
-        
-        # Viewpoint navigation node
-        n_view = new_graph.add_node("N_Q_VIEW", node_type="navigation")
-        
-        # Navigation to viewpoint arc
-        arc_to_view = new_graph.add_hyperarc(
-            parent=n_view,
-            children=[n_current],
-            action="NAVIGATE_TO_VIEW",
-            action_params={"q_view": q_view},
-            condition=lambda: True
-        )
-        
-        # Observation node
-        n_observation = new_graph.add_node("N_OBSERVATION", node_type="observation")
 
-        # Observation arc
-        arc_observe = new_graph.add_hyperarc(
-            parent=n_observation,
-            children=[n_view],
-            action="OBSERVE_AND_UPDATE_MAP",
-            action_params={"q_view": q_view},
-            condition=lambda: True
-        )
-        
-        # Direct navigation node
-        n_direct = new_graph.add_node("N_DIRECT", node_type="navigation")
+        # Nodes (use your existing node_type strings)
+        n_observation = new_graph.add_node("N_OBSERVATION", node_type="navigation")
+        n_vis_point   = new_graph.add_node("N_VIS_POINT",   node_type="navigation")
+        n_vis_done    = new_graph.add_node("N_VIS_DONE",    node_type="flag")
 
-        # Updated navigation arc
-        arc_direct = new_graph.add_hyperarc(
-            parent=n_direct,
+        # V0: go to visibility point from observation
+        new_graph.add_hyperarc(
+            parent=n_vis_point,
             children=[n_observation],
-            action="NAVIGATE_TO_FINAL_GOAL",
-            action_params={"q_goal": q_goal},
-            condition=lambda: True
+            action="NAVIGATE_TO_VIS_POINT",
+            action_params={"obstacle": obstacle},
+            condition=lambda: True,
         )
-        
-        # Final node
-        n_final = new_graph.add_node("N_FINAL", node_type="final")
 
-        # Final arc
-        arc_final = new_graph.add_hyperarc(
-            parent=n_final,
-            children=[n_direct],
-            action="REACH_FINAL_GOAL",
-            action_params={},
-            condition=lambda: True
+        # V1: run visibility action → mark done
+        new_graph.add_hyperarc(
+            parent=n_vis_done,
+            children=[n_vis_point],
+            action="VISIBILITY_ACTION",
+            action_params={"obstacle": obstacle},
+            condition=lambda: True,
         )
-        
+
+        # Initialize arc statuses using your existing utility
         self._update_initial_arc_statuses(new_graph)
         return new_graph
+
 
     def expand_graph_for_manipulation(self, obstacle, q_goal):
-        """Create a new graph for handling manipulation"""
+        """Manip + Visibility structure (existing AOGGraph API)."""
         new_graph = AOGGraph()
-        
-        # Current configuration node
-        n_current = new_graph.add_node("N_CURRENT_CONFIG", node_type="config")  
-        n_current.status = "ACHIEVED"
-        
-        # Manipulation pose node
-        n_q_manip = new_graph.add_node("N_Q_MANIP", node_type="navigation")
-        
-        # Navigation to manipulation pose arc
-        arc_to_manip = new_graph.add_hyperarc(
-            parent=n_q_manip,
+
+        # Nodes
+        n_current          = new_graph.add_node("N_CURRENT_CONFIG",    node_type="config"); n_current.status = "ACHIEVED"
+        n_q_observation    = new_graph.add_node("N_Q_OBSERVATION",    node_type="navigation")
+        n_observation_done = new_graph.add_node("N_OBSERVATION_DONE", node_type="flag")
+        n_vis_point        = new_graph.add_node("N_VIS_POINT",         node_type="navigation")
+        n_vis_done         = new_graph.add_node("N_VIS_DONE",          node_type="flag")
+        n_q_pre_manip      = new_graph.add_node("N_Q_PRE_MANIP",      node_type="navigation")
+        n_manip_done       = new_graph.add_node("N_MANIPULATION_DONE", node_type="flag")
+        n_final            = new_graph.add_node("N_FINAL",             node_type="final")
+
+        # Main path: current -> observation point
+        new_graph.add_hyperarc(
+            parent=n_q_observation,
             children=[n_current],
-            action="NAVIGATE_TO_MANIPULATION_POSE",
+            action="NAVIGATE_TO_OBSERVATION_POINT",
             action_params={"obstacle": obstacle},
-            condition=lambda: True
-            
-        )
-        
-        # Manipulation node
-        n_manipulation = new_graph.add_node("N_MANIPULATION", node_type="manipulation")
-        
-        # Manipulation arc
-        arc_manipulate = new_graph.add_hyperarc(
-            parent=n_manipulation,
-            children=[n_q_manip],
-            action="MANIPULATE_OBSTACLE",
             condition=lambda: True
         )
 
-        
-        # Final node
-        n_final = new_graph.add_node("N_FINAL", node_type="final")
-        
-        # Connect to final goal
-        arc_final = new_graph.add_hyperarc(
+        # Observe (YOLO placeholder) -> observation done
+        new_graph.add_hyperarc(
+            parent=n_observation_done,
+            children=[n_q_observation],
+            action="YOLO_OBSERVE_ACTION",
+            action_params={"obstacle": obstacle},
+            condition=lambda: True
+        )
+
+        # Visibility branch: observation -> vis point -> vis done
+        new_graph.add_hyperarc(
+            parent=n_vis_point,
+            children=[n_q_observation],
+            action="NAVIGATE_TO_VIS_POINT",
+            action_params={"obstacle": obstacle},
+            condition=lambda: True
+        )
+        new_graph.add_hyperarc(
+            parent=n_vis_done,
+            children=[n_vis_point],
+            action="VISIBILITY_ACTION",
+            action_params={"obstacle": obstacle},
+            condition=lambda: True
+        )
+
+        # AND-gate: need OBS_DONE & VIS_DONE → go to PRE_MANIP
+        new_graph.add_hyperarc(
+            parent=n_q_pre_manip,
+            children=[n_observation_done, n_vis_done],
+            action="NAVIGATE_TO_PRE_MANIP_POINT",
+            action_params={"obstacle": obstacle},
+            condition=lambda: True
+        )
+
+        # Do manipulation → manipulation done
+        new_graph.add_hyperarc(
+            parent=n_manip_done,
+            children=[n_q_pre_manip],
+            action="MANIPULATE_OBSTACLE",
+            action_params={"obstacle": obstacle},
+            condition=lambda: True
+        )
+
+        # Final navigation (optional) → N_FINAL
+        new_graph.add_hyperarc(
             parent=n_final,
-            children=[n_manipulation],
+            children=[n_manip_done],
             action="NAVIGATE_TO_FINAL_GOAL",
             action_params={"q_goal": q_goal},
             condition=lambda: True
         )
-        
-        # IMPORTANT: Update arc statuses after creating all arcs
+
+        # Initialize arc statuses based on children (existing utility)
         self._update_initial_arc_statuses(new_graph)
-        print(f"DEBUG: Created manipulation graph with {len(new_graph.hyperarcs)} arcs")
-        for i, arc in enumerate(new_graph.hyperarcs):
-            print(f"  Arc {i}: {arc.action} - Status: {arc.status}")
         return new_graph
+
 
 
 class GNSModule:
@@ -340,160 +349,826 @@ class MotionPlanner:
         self.node = node
         self.nav_client = ActionClient(node, NavigateToPose, 'navigate_to_pose', callback_group=callback_group)
         self.current_execution = None 
+        self.obstacle_dirs: dict[str, str] = {} #For storing obstacle directions
+        self.obstacle_manip_mode: dict[str, str] = {} # For storing obstacle manipulation modes
+
+        self.side_peek_client = self.create_client(
+            ComputeSidePeekPoints,
+            "compute_side_peek_points"
+        )
+
+        self.observe_client = ActionClient(
+            node,
+            ObserveObstacle,
+            'observe_obstacle',
+            callback_group=callback_group,
+        )
+        self.visibility_client = ActionClient(
+            node,
+            CheckVisibility,
+            'check_visibility',
+            callback_group=callback_group,
+        )
         
+        self.manip_client = ActionClient(
+            node,
+            ManipulateObstacle,
+            'manipulate_obstacle',   # jo bhi tumne server pe naam rakha hai
+            callback_group=callback_group,
+        )
+
+
+        while not self.side_peek_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("[Planner] Waiting for 'compute_side_peek_points' service...")
+
         # Hardcoded movable obstacles (for thesis simplicity)
         self.movable_obstacles = {
-            "test_box": {"x": 6.5, "y": 0.5, "length": 0.5, "width": 2.0},
-            "test_box_1": {"x": 4.64, "y": 9.15, "length": 0.25, "width": 0.25}
+        "test_box": {
+            "x": 6.5, "y": 0.5, "length": 0.5, "width": 2.0,
+            "marker": {  # map frame pose
+            "x": 6.2, "y": 0.5, "z": 0.90,
+            "qx": 0.0, "qy": 0.0, "qz": 0.7071, "qw": 0.7071  # I have to verify the x,y,z axis of marker.
+            }
+        },
+        "test_box_1": {
+            "x": 4.64, "y": 9.15, "length": 0.25, "width": 0.25,
+            "marker": {
+            "x": 4.60, "y": 9.10, "z": 0.88,
+            "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0        ## I have to verify the x,y,z axis of marker.
+            }
+        }
         }
 
+            # Add observation offsets
+        self.obs_forward_offset = 1.5  # meters in front of obstacle
+        self.obs_lateral_offset = 0.0  # centered laterally
+        
+    def compute_observation_pose(self, obstacle_name):
+        """Compute observation pose for given obstacle"""
+        if obstacle_name not in self.movable_obstacles:
+            self.node.get_logger().error(f"[OBS] Unknown obstacle: {obstacle_name}")
+            return None
+            
+        ob = self.movable_obstacles[obstacle_name]
+        marker = ob.get("marker", {})
+        
+        # Calculate angle to face the obstacle (from offset position)
+        # For now, assume obstacle is at 0 yaw (can be extended)
+        yaw = 0.0  # Default yaw
+        
+        try:
+            mx = float(marker["x"]);  my = float(marker["y"]);  # mz = float(marker["z"])  # (unused here)
+            qx = float(marker["qx"]); qy = float(marker["qy"])
+            qz = float(marker["qz"]); qw = float(marker["qw"])
+        except Exception:
+            self.node.get_logger().error(f"[OBS] Missing marker pose for obstacle '{obstacle_name}'")
+            return None
+        
+            # 1) Marker +Z (face normal) rotated into map frame, XY projection
+    #    R[:,2] (third column) of quaternion rotation matrix:
+        fx = 2.0 * (qx * qz + qy * qw)
+        fy = 2.0 * (qy * qz - qx * qw)
+        # (fz = 1 - 2*(qx*qx + qy*qy))  # not needed; we work on the ground plane
+
+        # normalize XY forward; fallback to +X if degenerate
+        norm = math.hypot(fx, fy)
+        if norm < 1e-6:
+            fx, fy = 1.0, 0.0
+        else:
+            fx /= norm; fy /= norm
+
+        # 2) Choose standoff distance d (robust default if fixed offset not set)
+        fixed = float(getattr(self, "obs_forward_offset", 0.0) or 0.0)
+        safety = float(getattr(self, "obs_safety", 0.25))
+        cammin = float(getattr(self, "camera_min_range", 0.35))
+        length = float(ob.get("length", 0.5))
+        d_auto = 0.5 * length + safety + cammin
+        d = fixed if fixed > 0.0 else d_auto
+
+        # 3) Observation position = marker_xy + d * forward(+Z_projected)
+        x_obs = mx + d * fx
+        y_obs = my + d * fy
+
+        # 4) Face the marker (look-at): yaw from obs -> marker
+        yaw_obs = math.atan2(my - y_obs, mx - x_obs)
+
+        # 5) Build pose (planar goal; z = 0 for base)
+        pose_stamped = PoseStamped()
+        pose_stamped.header.frame_id = "map"
+        pose_stamped.header.stamp = self.node.get_clock().now().to_msg()
+        pose_stamped.pose.position.x = x_obs
+        pose_stamped.pose.position.y = y_obs
+        pose_stamped.pose.position.z = 0.0
+
+        q = self._yaw_to_quaternion(yaw_obs)  # your existing helper
+        pose_stamped.pose.orientation = q
+        return pose_stamped
             
 
-    def execute_navigation(self, params):
-        """Execute a navigation action via Nav2"""
-        target_pose = params.get("target_pose")
-        action_label = params.get("action_label", "") 
+    
 
-        if action_label == "NAVIGATE_TO_MANIPULATION_POSE":
-            obstacle = params.get("obstacle")
-            obs_info = self.movable_obstacles.get(obstacle)
-            if not obs_info:
-                self.node.get_logger().error(f"Unknown obstacle: {obstacle}")
-                return ExecutionResult(success=False, failure_type="INVALID_OBSTACLE")
-            self.node.get_logger().info(f"[MANIPULATION] Action call for obstacle at {obs_info}")
-            success = self.node.call_manipulate_box_service(obs_info)
-            return ExecutionResult(success=success)
+    def _nav_to_pose(self, pose_stamped: PoseStamped, timeout_sec: float = 30.0) -> bool:
+        """
+        Low-level helper: send a NavigateToPose goal to Nav2 and wait for result.
 
-        if not target_pose:
-            return ExecutionResult(success=False, failure_type="INVALID_PARAMS")
-        
-        print(f"DEBUG: Sending goal to Nav2: {target_pose}")
+        Returns:
+            True  -> navigation succeeded
+            False -> failed / timeout / rejected
+        """
+        log = self.node.get_logger()
 
+        # 1) Wait for action server
+        if not self.nav_client.wait_for_server(timeout_sec=5.0):
+            log.error("[NAV] NavigateToPose action server not available")
+            return False
+
+        # 2) Build goal
         goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = self._create_pose_stamped(target_pose)
-        
-        # Send goal to Nav2
-        if not self.nav_client.wait_for_server(timeout_sec=10.0):
-            print("DEBUG: Nav2 action server not available!")
-            return ExecutionResult(success=False, failure_type="NAV2_UNAVAILABLE")
-        
-        print("DEBUG: Nav2 action server available, sending goal...")
-        future = self.nav_client.send_goal_async(goal_msg)
-    
-        # Wait for goal handle (goal acceptance response)
-        print("DEBUG: Waiting for goal acceptance...")
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec = 10)
-        
-        if not future.done():
-            print("DEBUG: Goal send timeout!")
-            return ExecutionResult(success=False, failure_type="GOAL_SEND_TIMEOUT")
-        
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            print("DEBUG: Goal REJECTED by action server")
-            return ExecutionResult(success=False, failure_type="GOAL_REJECTED")
-        
-        print("DEBUG: Goal ACCEPTED by action server!")
+        goal_msg.pose = pose_stamped
 
-        # Wait for result
-        print("DEBUG: Waiting for navigation result...")
+        log.info(f"[NAV] Sending goal to Nav2: "
+                 f"x={pose_stamped.pose.position.x:.2f}, "
+                 f"y={pose_stamped.pose.position.y:.2f}")
+
+        # 3) Send goal asynchronously
+        send_goal_future = self.nav_client.send_goal_async(
+            goal_msg
+        )
+
+        # 4) Wait for goal handle
+        rclpy.spin_until_future_complete(self.node, send_goal_future, timeout_sec=timeout_sec)
+        if not send_goal_future.done():
+            log.warn("[NAV] Timed out waiting for goal handle")
+            return False
+
+        goal_handle = send_goal_future.result()
+        if not goal_handle.accepted:
+            log.warn("[NAV] NavigateToPose goal rejected by server")
+            return False
+
+        log.info("[NAV] Goal accepted, waiting for result...")
+
+        # 5) Wait for result
         result_future = goal_handle.get_result_async()
-        #rclpy.spin_until_future_complete(self.node, result_future)  # Reduced timeout for testing\
-        start_time = time.time()
-        timeout_sec = 15.0
-    
-        while not result_future.done():
-            rclpy.spin_once(self.node, timeout_sec=0.1)
+        rclpy.spin_until_future_complete(self.node, result_future, timeout_sec=timeout_sec)
+        if not result_future.done():
+            log.warn("[NAV] Timed out waiting for Nav2 result, canceling goal")
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+            return False
+
         result = result_future.result()
-        print(f"DEBUG: Navigation result status: {result}")
-        
-        if result and hasattr(result, 'status'):
-            if result.status == GoalStatus.STATUS_SUCCEEDED:
-                print("DEBUG: Navigation SUCCEEDED!")
-                return ExecutionResult(success=True)
-            else:
-                print(f"DEBUG: Navigation FAILED with status: {result.status}")
-                # Get both failure_type AND blocking_obstacle
-                failure_type, blocking_obstacle = self._analyze_navigation_failure(target_pose, self.node.planner.q_current)
-                return ExecutionResult(
-                    success=False, 
-                    failure_type=failure_type,
-                    blocking_obstacle=blocking_obstacle
-                )
+        status = result.status
+
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            log.info("[NAV] NavigateToPose SUCCEEDED ✅")
+            return True
         else:
-            print(f"DEBUG: Navigation FAILED with status: {result.status}")
-            # Get both failure_type AND blocking_obstacle in one call
-            failure_type, blocking_obstacle = self._analyze_navigation_failure(target_pose, self.node.planner.q_current)
-            return ExecutionResult(
-                success=False, 
-                failure_type=failure_type,
-                blocking_obstacle=blocking_obstacle  # Pass obstacle info
-            )
+            log.warn(f"[NAV] NavigateToPose FAILED with status={status}")
+            return False
+
+
+    def execute_navigation(self, label, params):
+        """
+        Execute navigation-type hyperarcs.
+        Implements: NAVIGATE_TO_OBSERVATION_POINT
+        """
+        log = self.node.get_logger()
+
+        try:
+            if label == "NAVIGATE_TO_OBSERVATION_POINT":
+                obstacle = params.get("obstacle", None)
+                if not obstacle:
+                    log.error("[NAV] NAVIGATE_TO_OBSERVATION_POINT: missing 'obstacle' param")
+                    return ExecutionResult(success=False,
+                                           failure_type="INVALID_PARAMS")
+
+                # 1) Observation pose compute karo
+                pose = self.compute_observation_pose(obstacle)
+                if pose is None:
+                    log.error(f"[NAV] Failed to compute observation pose for '{obstacle}'")
+                    return ExecutionResult(success=False,
+                                           failure_type="COMPUTE_OBS_POSE_FAILED",
+                                           failure_context={"obstacle": obstacle})
+
+                # 2) Nav2 ko goal bhejo
+                timeout_sec = float(getattr(self, "obs_nav_timeout_sec", 20.0))
+                log.info(f"[NAV] Going to OBS pose for '{obstacle}' (timeout={timeout_sec:.1f}s)")
+                ok = self._nav_to_pose(pose, timeout_sec=timeout_sec)
+
+                # 3) Result check
+                if ok:
+                    log.info(f"[NAV] Reached observation pose for '{obstacle}' ✅")
+                    return ExecutionResult(
+                        success=True,
+                        new_position=[pose.pose.position.x,
+                                      pose.pose.position.y,
+                                      0.0]
+                    )
+                else:
+                    log.warn(f"[NAV] Failed to reach observation pose for '{obstacle}' ❌")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="NAV_FAILED_OBS",
+                        failure_context={"obstacle": obstacle}
+                    )
+
+            elif label == "NAVIGATE_TO_VIS_POINT":
+                log.info("[NAV] Starting NAVIGATE_TO_VIS_POINT")
+
+                # 1. Obstacle name from params
+                obstacle = params.get("obstacle")
+                if obstacle is None:
+                    log.warn("[NAV_VIS] No obstacle specified in params")
+                    return ExecutionResult(success=False, failure_type="NO_OBSTACLE_NAME")
+
+                # 2. Get obstacle info from planner dictionary
+                if obstacle not in self.movable_obstacles:
+                    log.warn(f"[NAV_VIS] Obstacle '{obstacle}' not found in movable_obstacles")
+                    return ExecutionResult(success=False, failure_type="UNKNOWN_OBSTACLE")
+
+                ob = self.movable_obstacles[obstacle]
+                box_x = float(ob["x"])
+                box_y = float(ob["y"])
+                box_L = float(ob["length"])
+                box_W = float(ob["width"])
+
+                # 3. Make service request to push node
+                req = ComputeSidePeekPoints.Request()
+                req.box_x = box_x
+                req.box_y = box_y
+                req.box_L = box_L
+                req.box_W = box_W
+
+                log.info("[NAV_VIS] Requesting side-peek points from push node...")
+                future = self.side_peek_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
+                res = future.result()
+
+                if (not res) or (not res.success):
+                    log.warn("[NAV_VIS] Push node could not compute side-peek points")
+                    return ExecutionResult(success=False, failure_type="NO_VIS_POINTS")
+
+                 # 3.5 store direction for this obstacle
+                vis_dir = res.dir   # "+X" / "-X" / "+Y" / "-Y"
+                self.obstacle_dirs[obstacle] = vis_dir
+                log.info(f"[NAV_VIS] Stored vis_dir={vis_dir} for obstacle={obstacle}")
+
+
+                # 4. Extract left & right points
+                left  = (res.left_x,  res.left_y,  res.left_yaw)
+                right = (res.right_x, res.right_y, res.right_yaw)
+
+                log.info(f"[NAV_VIS] Side-peek points received:")
+                log.info(f"         LEFT : {left}")
+                log.info(f"         RIGHT: {right}")
+                log.info(f"[NAV_VIS] Chosen push direction (from push node) = {vis_dir}")
+
+
+                # 5. Choose the nearest point automatically
+                rx, ry, _ = self.q_current  # already maintained in planner
+
+                def dist(p):
+                    return (p[0] - rx)**2 + (p[1] - ry)**2
+
+                best = left if dist(left) < dist(right) else right
+                bx, by, byaw = best
+
+                log.info(f"[NAV_VIS] Selected target = ({bx:.2f}, {by:.2f}, {math.degrees(byaw):.1f}°)")
+
+                # 6. Navigate using planner's own Nav2 wrapper
+                nav_ok = self._nav_to_pose(bx, by, byaw)
+
+                if not nav_ok:
+                    log.warn("[NAV_VIS] Navigation to vis-point failed")
+                    return ExecutionResult(success=False, failure_type="NAV_FAILED")
+
+                log.info("[NAV_VIS] Successfully reached visibility point!")
+                return ExecutionResult(
+                    success=True,
+                    new_position=[bx, by, byaw]
+                )
+
+
+            
+            elif label == "NAVIGATE_TO_PRE_MANIP_POINT":
+                log.info("[NAV] Starting NAVIGATE_TO_PRE_MANIP_POINT")
+
+                # 1. Obstacle from params
+                obstacle = params.get("obstacle")
+                if obstacle is None:
+                    log.warning("[PRE_MANIP] No obstacle specified in params")
+                    return ExecutionResult(success=False, failure_type="NO_OBSTACLE_NAME")
+
+                # 2. Obstacle info
+                if obstacle not in self.movable_obstacles:
+                    log.warning(f"[PRE_MANIP] Obstacle '{obstacle}' not found in movable_obstacles")
+                    return ExecutionResult(success=False, failure_type="UNKNOWN_OBSTACLE")
+
+                ob = self.movable_obstacles[obstacle]
+                box_x = float(ob["x"])
+                box_y = float(ob["y"])
+                box_L = float(ob["length"])
+                box_W = float(ob["width"])
+
+                # 3. Direction (vis_dir) reuse from previous step
+                vis_dir = self.obstacle_dirs.get(obstacle)
+                if vis_dir is None:
+                    log.warning(f"[PRE_MANIP] No stored vis_dir for obstacle={obstacle}")
+                    return ExecutionResult(success=False, failure_type="NO_VIS_DIR")
+
+                log.info(f"[PRE_MANIP] Using vis_dir={vis_dir} for obstacle={obstacle}")
+
+                # 4. Call push node to get pre-manip pose
+                req = ComputePreManipPose.Request()
+                req.box_x = box_x
+                req.box_y = box_y
+                req.box_L = box_L
+                req.box_W = box_W
+                req.dir   = vis_dir
+
+                log.info("[PRE_MANIP] Requesting pre-manip pose from push node...")
+                future = self.pre_manip_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
+                res = future.result()
+
+                if (not res) or (not res.success):
+                    log.warning("[PRE_MANIP] Push node could not compute pre-manip pose")
+                    return ExecutionResult(success=False, failure_type="NO_PRE_MANIP_POSE")
+
+                px, py, pyaw = res.pre_x, res.pre_y, res.pre_yaw
+                log.info(f"[PRE_MANIP] Target pre-manip pose = ({px:.2f}, {py:.2f}, {math.degrees(pyaw):.1f}deg)")
+
+                # 5. Navigate using planner's own Nav2 wrapper
+                nav_ok = self._nav_to_pose(px, py, pyaw)
+                if not nav_ok:
+                    log.warning("[PRE_MANIP] Navigation to pre-manip pose failed")
+                    return ExecutionResult(success=False, failure_type="NAV_FAILED")
+
+                log.info("[PRE_MANIP] Successfully reached pre-manip pose!")
+                return ExecutionResult(
+                    success=True,
+                    new_position=[px, py, pyaw]
+                )
+            
+            elif label == "NAVIGATE_TO_FINAL_GOAL":
+                log.info("[NAV] Starting NAVIGATE_TO_FINAL_GOAL")
+
+                # 1. Get final goal node pose
+                node = params.get("node")
+                if node is None:
+                    log.warning("[NAV_FINAL] No final node provided in params")
+                    return ExecutionResult(success=False, failure_type="NO_FINAL_NODE")
+
+                # 'node.position' already contains [x, y, yaw] as per graph framework
+                try:
+                    goal_x, goal_y, goal_yaw = node.position
+                except Exception:
+                    log.warning("[NAV_FINAL] node.position missing or invalid")
+                    return ExecutionResult(success=False, failure_type="INVALID_FINAL_GOAL")
+
+                log.info(f"[NAV_FINAL] Navigating to final goal: "
+                        f"({goal_x:.2f}, {goal_y:.2f}, {math.degrees(goal_yaw):.1f}°)")
+
+                # 2. Use planner's nav2 wrapper to move robot
+                nav_ok = self._nav_to_pose(goal_x, goal_y, goal_yaw)
+
+                if not nav_ok:
+                    log.warning("[NAV_FINAL] Navigation to final goal failed")
+                    return ExecutionResult(success=False, failure_type="NAV_FINAL_FAILED")
+
+                log.info("[NAV_FINAL] Successfully reached final goal!")
+
+                # 3. Report success
+                return ExecutionResult(
+                    success=True,
+                    new_position=[goal_x, goal_y, goal_yaw]
+                )
+
+
+            else:
+                log.error(f"[NAV] Unknown navigation label: {label}")
+                return ExecutionResult(success=False, failure_type="UNKNOWN_LABEL",
+                                       failure_context={"label": label})
+
+        except Exception as e:
+            log.error(f"[NAV] Exception in execute_navigation({label}): {e}")
+            return ExecutionResult(success=False,
+                                   failure_type="EXCEPTION",
+                                   failure_context={"err": str(e), "label": label})
+
     
          
-    def execute_observation(self, params):
-        """Execute an observation action"""
-        q_view = params.get("q_view")
-        if not q_view:
-            return ExecutionResult(success=False, failure_type="INVALID_PARAMS")
-        
-        # Navigate to viewpoint first
-        nav_result = self.execute_navigation({"target_pose": q_view})
-        if not nav_result.success:
-            return nav_result
-        
-        # Simulate observation (in real implementation, trigger sensors)
-        self.node.get_logger().info("Performing observation...")
-        
-        # Simulate map update (simplified)
-        map_updates = [{"position": q_view, "status": "observed"}]
-        
-        return ExecutionResult(
-            success=True, 
-            new_position=q_view,
-            map_updates=map_updates
+    def execute_observation(self, label, params):
+        """
+        Base structure for all observation-related actions.
+        Handles:
+        - YOLO_OBSERVE_ACTION
+        - VISIBILITY_ACTION
+        Currently: Only logs + dummy success result.
+        """
+
+        # Extract params (if passed)
+        obstacle = params.get("obstacle")
+        node = params.get("node")
+        vis_dir = params.get("vis_dir")  # optional
+        self.node.get_logger().info(
+            f"[OBS] execute_observation | label={label} | obstacle={obstacle}"
+            )
+
+        node_name = getattr(node, "name", None)
+
+        # Log entry
+        self.logger.info(
+            f"[OBS] execute_observation called | label={label} | "
+            f"obstacle={obstacle} | node={node_name} | vis_dir={vis_dir}"
         )
-    
-      
-    
-    def _analyze_navigation_failure(self, target_pose,current_pose):
-        """Analyze why navigation failed and determine failure type"""
-        # For testing: Force a manipulation issue to test the fix
-        # Check if target is near known obstacles
-        target_x, target_y = target_pose[0], target_pose[1]
 
-        # Check robot's current position
-        current_x, current_y = current_pose[0], current_pose[1]
-        # Distance to target
-        target_distance = math.sqrt((current_x - target_x)**2 + (current_y - target_y)**2)
-        print(f"DEBUG: Robot-target distance: {target_distance:.2f}m")
-    
-        min_distance = float('inf')
-        blocking_obstacle = None  # <-- FIX: Initialize blocking_obstacle
+        try:
+            # -------------------------------
+            # CASE 1: YOLO OBSERVE ACTION
+            # -------------------------------
+            if label == "YOLO_OBSERVE_ACTION":
+                # 1) Basic checks
+                if not obstacle:
+                    self.log.error("[OBS][YOLO] Missing 'obstacle' in params.")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="INVALID_PARAMS",
+                        failure_context="YOLO_OBSERVE_ACTION requires 'obstacle' in params",
+                    )
+                self.logger.info(
+                    f"[OBS][YOLO] Starting YOLO observation for obstacle={obstacle}"
+                )
+                # 2) Wait for observation action server
+                if not self.observe_client.wait_for_server(timeout_sec=5.0):
+                    self.log.error("[OBS][YOLO] observe_obstacle action server not available.")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="OBS_ACTION_UNAVAILABLE",
+                        failure_context="observe_obstacle action server not available",
+                    )
+                
+                # 3) Build goal
+                goal = ObserveObstacle.Goal()
+                goal.obstacle_name = obstacle
+                
+                 # 4) Send goal
+                try:
+                    send_goal_future = self.observe_client.send_goal_async(goal)
+                    rclpy.spin_until_future_complete(node, send_goal_future)
+                    goal_handle = send_goal_future.result()
+                except Exception as exc:
+                    self.log.error(f"[OBS][YOLO] Exception while sending goal: {exc!r}")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="OBS_GOAL_SEND_ERROR",
+                        failure_context=str(exc),
+                    )
+                
+                if goal_handle is None or not goal_handle.accepted:
+                    self.log.error("[OBS][YOLO] ObserveObstacle goal was rejected.")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="OBS_GOAL_REJECTED",
+                    )
+                
+                self.log.info("[OBS][YOLO] ObserveObstacle goal accepted. Waiting for result...")
 
-        # Check distance to movable obstacles
-        for obstacle_name, obstacle_pos in self.movable_obstacles.items():
-            # Distance from target to obstacle
-            target_obs_distance = math.sqrt((target_x - obstacle_pos["x"])**2 + 
-                                        (target_y - obstacle_pos["y"])**2)
+
+                # 5) Wait for result
+                try:
+                    result_future = goal_handle.get_result_async()
+                    rclpy.spin_until_future_complete(node, result_future)
+                    action_result = result_future.result().result
+                except Exception as exc:
+                    self.log.error(f"[OBS][YOLO] Exception while waiting for result: {exc!r}")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="OBS_RESULT_ERROR",
+                        failure_context=str(exc),
+                    )
+                
+                # 6) Map action result → ExecutionResult
+                if action_result.success:
+                    mode = (action_result.label or "").strip()
+                    self.log.info(
+                        f"[OBS][YOLO] Observation succeeded | "
+                        f"label='{mode}' | msg='{action_result.message}'"
+                    )
+                    if mode not in ("pushable_movable", "pullable_movable"):
+                        self.log.error(
+                            f"[OBS][YOLO] Unknown manipulation mode '{mode}' "
+                            f"for obstacle={obstacle}"
+                        )
+                        return ExecutionResult(
+                            success=False,
+                            failure_type="UNKNOWN_MANIP_MODE",
+                            failure_context={"obstacle": obstacle, "label": mode},
+                        )
+                    self.obstacle_manip_mode[obstacle] = mode
+                    self.get_logger().info(
+                        f"[OBS][YOLO] Stored manip mode '{mode}' for obstacle={obstacle}"
+                    )
+                    return ExecutionResult(success=True)
+                else:
+                    self.log.error(
+                        f"[OBS][YOLO] Observation failed for obstacle={obstacle} | "
+                        f"label='{action_result.label}' | msg='{action_result.message}'"
+                    )
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="OBSERVATION_FAILED",
+                        failure_context={"obstacle": obstacle, "message": action_result.message},
+                    )
+
+
+            # -------------------------------
+            # CASE 2: VISIBILITY ACTION
+            # -------------------------------
+            elif label == "VISIBILITY_ACTION":
+                if not obstacle:
+                    self.logger.error("[OBS][VIS] Missing 'obstacle' in params.")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="INVALID_PARAMS",
+                        failure_context="VISIBILITY_ACTION requires 'obstacle' in params",
+                    )
+
+                # Direction: prefer explicit vis_dir in params, otherwise use stored from NAVIGATE_TO_VIS_POINT
+                vis_dir_final = vis_dir or self.obstacle_dirs.get(obstacle)
+                if not vis_dir_final:
+                    self.logger.error(
+                        f"[OBS][VIS] No visibility direction for obstacle={obstacle} "
+                        "(run NAVIGATE_TO_VIS_POINT first?)"
+                    )
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="NO_VIS_DIR",
+                        failure_context={"obstacle": obstacle},
+                    )
+
+                self.logger.info(
+                    f"[OBS][VIS] Starting visibility check | "
+                    f"obstacle={obstacle} | vis_dir={vis_dir_final}"
+                )
+
+                # Wait for visibility action server
+                if not self.visibility_client.wait_for_server(timeout_sec=5.0):
+                    self.logger.error("[OBS][VIS] check_visibility action server not available.")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="VIS_ACTION_UNAVAILABLE",
+                    )
+
+                # Build goal: ONLY name + dir + duration
+                goal = CheckVisibility.Goal()
+                goal.obstacle_name = obstacle
+                goal.vis_dir = vis_dir_final
+                goal.duration_sec = float(getattr(self, "vis_duration_sec", 10.0))
+
+                # Send goal
+                try:
+                    send_goal_future = self.visibility_client.send_goal_async(goal)
+                    rclpy.spin_until_future_complete(self.node, send_goal_future)
+                    goal_handle = send_goal_future.result()
+                except Exception as exc:
+                    self.logger.error(f"[OBS][VIS] Exception while sending goal: {exc!r}")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="VIS_GOAL_SEND_ERROR",
+                        failure_context=str(exc),
+                    )
+
+                if goal_handle is None or not goal_handle.accepted:
+                    self.logger.error("[OBS][VIS] CheckVisibility goal was rejected.")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="VIS_GOAL_REJECTED",
+                        failure_context={"obstacle": obstacle},
+                    )
+
+                self.logger.info("[OBS][VIS] Goal accepted. Waiting for result...")
+
+                # Wait for result
+                try:
+                    result_future = goal_handle.get_result_async()
+                    rclpy.spin_until_future_complete(self.node, result_future)
+                    action_result = result_future.result().result
+                except Exception as exc:
+                    self.logger.error(f"[OBS][VIS] Exception while waiting for result: {exc!r}")
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="VIS_RESULT_ERROR",
+                        failure_context=str(exc),
+                    )
+
+                blocked = bool(getattr(action_result, "obstacle_present", True))
+                if blocked:
+                    self.logger.warning(f"[OBS][VIS] Visibility check: OBSTACLE PRESENT for {obstacle}")
+                else:
+                    self.logger.info(f"[OBS][VIS] Visibility check: area clear for {obstacle}")
+
+                # Abhi ke liye: action execution success treat karte hain,
+                # 'blocked' ko context me store kar dete hain.
+                return ExecutionResult(
+                    success=True,
+                    failure_context={"obstacle": obstacle, "blocked": blocked},
+                )
+
+            # -------------------------------
+            # UNKNOWN LABEL (safety)
+            # -------------------------------
+            else:
+                self.logger.error(f"[OBS] Unknown observation label received: {label}")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="UNKNOWN_OBSERVATION_LABEL"
+                )
+
+        except Exception as exc:
+            self.logger.error(f"[OBS] Exception in execute_observation: {exc!r}")
+            return ExecutionResult(
+                success=False,
+                failure_type="OBSERVATION_ERROR",
+                failure_context=str(exc)
+            )
+
+    def execute_manipulation(self, label, params):
+        """
+        MANIPULATE_OBSTACLE ke liye high-level dispatcher.
+        YOLO se stored mode (pushable_movable / pullable_movable) ke basis pe
+        alag pipeline select karega.
+        """
+        log = self.node.get_logger()
+        obstacle = params.get("obstacle")
+
+        if label != "MANIPULATE_OBSTACLE":
+            log.error(f"[MANIP] Unknown manipulation label: {label}")
+            return ExecutionResult(
+                success=False,
+                failure_type="UNKNOWN_MANIP_LABEL",
+                failure_context={"label": label},
+            )
+
+        if not obstacle:
+            log.error("[MANIP] MANIPULATE_OBSTACLE: missing 'obstacle' param")
+            return ExecutionResult(
+                success=False,
+                failure_type="INVALID_PARAMS",
+                failure_context="MANIPULATE_OBSTACLE requires 'obstacle' in params",
+            )
+
+        # 1) Check obstacle known hai ya nahi
+        if obstacle not in self.movable_obstacles:
+            log.error(f"[MANIP] Unknown obstacle '{obstacle}' (not in movable_obstacles)")
+            return ExecutionResult(
+                success=False,
+                failure_type="UNKNOWN_OBSTACLE",
+                failure_context={"obstacle": obstacle},
+            )
+
+        # 2) YOLO se aaya hua mode padho
+        mode = self.obstacle_manip_mode.get(obstacle)
+        if mode is None:
+            log.error(
+                f"[MANIP] No manipulation mode stored for obstacle={obstacle} "
+                f"(YOLO_OBSERVE_ACTION shayad run nahi hua?)"
+            )
+            return ExecutionResult(
+                success=False,
+                failure_type="NO_MANIP_MODE",
+                failure_context={"obstacle": obstacle},
+            )
+
+        log.info(f"[MANIP] Manipulating obstacle={obstacle} with mode='{mode}'")
+
+        # 3) Branch: pushable vs pullable
+        if mode == "pushable_movable":
+            if mode == "pushable_movable":
+            # 3.1 direction (vis_dir) pehle NAVIGATE_TO_VIS_POINT me store hui thi
+            push_dir = self.obstacle_dirs.get(obstacle)
+            if push_dir is None:
+                log.error(
+                    f"[MANIP] No stored push_dir / vis_dir for obstacle={obstacle} "
+                    f"(NAVIGATE_TO_VIS_POINT shayad run nahi hua?)"
+                )
+                return ExecutionResult(
+                    success=False,
+                    failure_type="NO_PUSH_DIR",
+                    failure_context={"obstacle": obstacle},
+                )
+
+            log.info(f"[MANIP][PUSH] Using push_dir={push_dir} for obstacle={obstacle}")
+
+            # 3.2 wait for action server
+            if not self.manip_client.wait_for_server(timeout_sec=5.0):
+                log.error("[MANIP][PUSH] manipulate_obstacle action server not available")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="MANIP_ACTION_UNAVAILABLE",
+                )
+
+            # 3.3 goal banao
+            goal = ManipulateObstacle.Goal()
+            goal.obstacle_name = obstacle
+            goal.push_dir = push_dir
+
+            # 3.4 goal send karo
+            try:
+                send_goal_future = self.manip_client.send_goal_async(goal)
+                rclpy.spin_until_future_complete(self.node, send_goal_future)
+                goal_handle = send_goal_future.result()
+            except Exception as exc:
+                log.error(f"[MANIP][PUSH] Exception while sending goal: {exc!r}")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="MANIP_GOAL_SEND_ERROR",
+                    failure_context=str(exc),
+                )
+
+            if goal_handle is None or not goal_handle.accepted:
+                log.error("[MANIP][PUSH] ManipulateObstacle goal was rejected.")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="MANIP_GOAL_REJECTED",
+                    failure_context={"obstacle": obstacle},
+                )
+
+            log.info("[MANIP][PUSH] Goal accepted. Waiting for result...")
+
+            # 3.5 result ka wait
+            try:
+                result_future = goal_handle.get_result_async()
+                rclpy.spin_until_future_complete(self.node, result_future)
+                action_result = result_future.result().result
+            except Exception as exc:
+                log.error(f"[MANIP][PUSH] Exception while waiting for result: {exc!r}")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="MANIP_RESULT_ERROR",
+                    failure_context=str(exc),
+                )
+
+            # 3.6 action result → ExecutionResult
+            if getattr(action_result, "success", False):
+                msg = getattr(action_result, "message", "")
+                log.info(f"[MANIP][PUSH] Manipulation succeeded | msg='{msg}'")
+                return ExecutionResult(success=True)
+            else:
+                msg = getattr(action_result, "message", "")
+                log.error(f"[MANIP][PUSH] Manipulation failed | msg='{msg}'")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="PUSH_FAILED",
+                    failure_context={"obstacle": obstacle, "message": msg},
+                )
             
-            # Distance from robot to obstacle
-            robot_obs_distance = math.sqrt((current_x - obstacle_pos["x"])**2 + 
-                                        (current_y - obstacle_pos["y"])**2)
-            
-            print(f"DEBUG: Obstacle {obstacle_name} - Target distance: {target_obs_distance:.2f}m, Robot distance: {robot_obs_distance:.2f}m")
-            
-            # If target is near obstacle AND robot got close to obstacle
-            if target_obs_distance < 10 and robot_obs_distance < 15:
-                print(f"DEBUG: Navigation blocked by movable obstacle: {obstacle_name}")
-                if robot_obs_distance < min_distance:
-                    min_distance = robot_obs_distance
-                    blocking_obstacle = obstacle_name
-        if blocking_obstacle:
-            print(f"DEBUG: Navigation blocked by: {blocking_obstacle}")
-            return "MANIPULATION_ISSUE", blocking_obstacle
+
+        elif mode == "pullable_movable":
+            # 👉 Yaha PULL strategy (alag motion, maybe different action)
+            log.info(f"[MANIP] Running PULL strategy for obstacle={obstacle}")
         else:
-            return "VISIBILITY_ISSUE", None
+            log.error(f"[MANIP] Unexpected manip mode '{mode}' for obstacle={obstacle}")
+            return ExecutionResult(
+                success=False,
+                failure_type="UNKNOWN_MANIP_MODE",
+                failure_context={"obstacle": obstacle, "mode": mode},
+            )
+
+    
+    def _analyze_navigation_failure(self, nav_result, goal_pose):
+        """
+        Always route failures to MANIPULATION_ISSUE.
+        Optionally attach the nearest blocking obstacle name for downstream use.
+        """
+        # Try to reuse existing helper if present
+        blocking_obstacle = None
+        try:
+            # existing function in your codebase (if you have it)
+            blocking_obstacle = self._nearest_movable_obstacle(goal_pose)
+        except AttributeError:
+            # minimal fallback: pick from self.movable_obstacles if available
+            try:
+                blocking_obstacle = self._pick_nearest_by_xy(goal_pose, getattr(self, "movable_obstacles", []))
+            except Exception:
+                blocking_obstacle = None
+
+        failure_context = {
+            "reason": "MANIPULATION_ISSUE",
+            "blocking_obstacle": blocking_obstacle,
+            "goal": {
+                "x": getattr(goal_pose.pose.position, "x", None),
+                "y": getattr(goal_pose.pose.position, "y", None),
+                "z": getattr(goal_pose.pose.position, "z", None),
+            }
+        }
+
+        # Always force manipulation
+        return "MANIPULATION_ISSUE", failure_context
+
 
     def _create_pose_stamped(self, position):
         """Create PoseStamped message from position"""
@@ -717,33 +1392,60 @@ class VANAMOPlanner:
                 return "FAILURE"
     
     def _execute_hyperarc(self, arc):
-        """Execute a hyperarc through motion planning"""
-        self.node.get_logger().info(f"DEBUG: Executing arc: {arc.action}")
-        self.node.get_logger().info(f"DEBUG: Arc action_params: {arc.action_params}")
-        
-        if arc.action.startswith("NAVIGATE"):
-            if "NAVIGATE_TO_FINAL_GOAL" in arc.action:
-                params = {"target_pose": self.q_goal}
-                self.node.get_logger().info(f"DEBUG: Using final goal: {self.q_goal}")
-            elif "VIEW" in arc.action:
-                params = {"target_pose": arc.action_params.get("q_view")}
-                self.node.get_logger().info(f"DEBUG: Using view pose: {arc.action_params.get('q_view')}")
-            else:
-                params = {"target_pose": self.q_goal, "action_label": arc.action, **arc.action_params}
-                self.node.get_logger().info(f"DEBUG: Using default goal: {self.q_goal}")
-            return self.motion_planner.execute_navigation(params)
-            
-        elif arc.action.startswith("OBSERVE"):
-            return self.motion_planner.execute_observation(arc.action_params)
-            
-        elif arc.action.startswith("MANIPULATE"):
-            return ExecutionResult(
-            success=True,
-            new_position=self.node.planner.q_current,
-            map_updates=[]
-            )  # We already achieved this in the service call.
+        """
+        Dispatch a hyperarc to the right executor based on its action label.
+        Returns an ExecutionResult(success: bool, payload: dict|None).
 
-        return ExecutionResult(success=False, failure_type="UNKNOWN_ACTION")
+        Handled labels:
+        - NAVIGATE_TO_OBSERVATION_POINT
+        - YOLO_OBSERVE_ACTION
+        - NAVIGATE_TO_VIS_POINT
+        - VISIBILITY_ACTION
+        - NAVIGATE_TO_PRE_MANIP_POINT
+        - MANIPULATE_OBSTACLE
+        - NAVIGATE_TO_FINAL_GOAL
+        """
+        label  = getattr(arc, "action", None)
+        params = getattr(arc, "action_params", None) or {}
+
+        if not label:
+            self.get_logger().error("[AOG] Missing action label on hyperarc")
+            return ExecutionResult(success=False, failure_type="MISSING_LABEL", failure_context={"err": "missing_label"})
+
+        NAVIGATION = {
+            "NAVIGATE_TO_OBSERVATION_POINT",
+            "NAVIGATE_TO_VIS_POINT",
+            "NAVIGATE_TO_PRE_MANIP_POINT",
+            "NAVIGATE_TO_FINAL_GOAL",
+        }
+        OBSERVATION = {
+            "YOLO_OBSERVE_ACTION",
+            "VISIBILITY_ACTION",
+        }
+        MANIPULATION = {
+            "MANIPULATE_OBSTACLE",
+        }
+
+        self.get_logger().info(f"[AOG] Action start: {label} | params={params}")
+        try:
+            if label in NAVIGATION:
+                result = self.execute_navigation(label, params)
+            elif label in OBSERVATION:
+                result = self.execute_observation(label, params)
+            elif label in MANIPULATION:
+                result = self.execute_manipulation(label, params)
+            else:
+                self.get_logger().error(f"[AOG] Unknown action '{label}'")
+                return ExecutionResult(success=False, failure_type="UNKNOWN_ACTION", failure_context={"err": "unknown_action", "action": label})
+
+            ok = bool(getattr(result, "success", False))
+            self.get_logger().info(f"[AOG] Action end  : {label} | success={ok}")
+            return result
+
+        except Exception as e:
+            self.get_logger().error(f"[AOG] Action error: {label} | {e}")
+            return ExecutionResult(success=False, failure_type="ACTION_EXCEPTION", failure_context={"err": str(e), "action": label})
+
     
     def _update_environment(self, result):
         """Update environment based on execution results"""
@@ -895,7 +1597,7 @@ class VANAMOPlannerNode(Node):
     def __init__(self):
         super().__init__('vanamo_planner')
 
-        self.manipulate_box_client = ActionClient(self, ManipulateBox, 'manipulate_box')
+        self.manipulate_box_client = ActionClient(self, ManipulateObstacle, 'manipulate_box')
 
 
 
@@ -969,36 +1671,7 @@ class VANAMOPlannerNode(Node):
         )
         self.get_logger().info("VANAMO Planner Node initialized")
 
-    def call_manipulate_box_service(self, obstacle_info):
-        if not self.manipulate_box_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().warn("manipulate_box action server unavailable!")
-            return False
 
-        goal = ManipulateBox.Goal()
-        goal.x = float(obstacle_info["x"])
-        goal.y = float(obstacle_info["y"])
-        goal.length = float(obstacle_info["length"])
-        goal.width = float(obstacle_info["width"])
-
-        send_goal_future = self.manipulate_box_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_goal_future)
-
-        goal_handle = send_goal_future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn("ManipulateBox goal rejected!")
-            return False
-
-        self.get_logger().info("ManipulateBox goal accepted, waiting for result...")
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
-        result = result_future.result().result
-
-        if result.success:
-            self.get_logger().info("Manipulation succeeded via action.")
-            return True
-        else:
-            self.get_logger().warn("Manipulation failed via action.")
-            return False
 
 
     def path_callback(self, msg):

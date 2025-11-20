@@ -39,12 +39,21 @@ find_package(vision_msgs REQUIRED)
 
 ## Generate service interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/ManipulateBox.action"
-  "srv/VisibilityCheck.srv"
+  "action/ManipulateObstacle.action"
+  "action/CheckVisibility.action"
+  "action/ObserveObstacle.action"
+  "srv/ComputePreManipPose.srv"
+  "srv/ComputeSidePeekPoints.srv"
   DEPENDENCIES builtin_interfaces action_msgs std_msgs geometry_msgs
 )
 
 # Install resources
+
+install(
+  DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
 install(DIRECTORY
   config launch rviz maps behavior_trees
   DESTINATION share/${PROJECT_NAME}
@@ -54,21 +63,36 @@ install(PROGRAMS scripts/Planner_explanation.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(PROGRAMS scripts/LiDar_Dection.py
+# observe_obstacle_server
+install(PROGRAMS scripts/observe_obstacle_server.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME observe_obstacle_server
 )
 
-install(PROGRAMS scripts/lstar_obstacle_checker.py
+# push_geometry_server
+install(PROGRAMS scripts/push_geometry_server.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME push_geometry_server
 )
+
+# push_manipulation_action_server
+install(PROGRAMS scripts/push_manipulation_action_server.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME push_manipulation_action_server
+)
+
+# lstar_obstacle_checker -> visibility_action
+install(PROGRAMS scripts/visibility_action.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME visibility_action
+)
+
 
 install(PROGRAMS scripts/yolo_detector.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(PROGRAMS scripts/push.py
-  DESTINATION lib/${PROJECT_NAME}
-)
+
 
 # Tests (optional)
 if(BUILD_TESTING)
