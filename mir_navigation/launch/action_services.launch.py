@@ -12,9 +12,8 @@ def generate_launch_description():
             name='observe_obstacle_server',
             output='screen',
             emulate_tty=True,
-            prefix='xterm -e',
+            prefix='gnome-terminal --title=observe_obstacle_server -- bash -c',
         ),
-
         # 2) push_geometry_server
         Node(
             package='mir_navigation',
@@ -22,7 +21,8 @@ def generate_launch_description():
             name='push_geometry_server',
             output='screen',
             emulate_tty=True,
-            prefix='xterm -e',
+            prefix='gnome-terminal --title=push_geometry_server -- bash -c'
+,
         ),
 
         # 3) push_manipulation_action_server
@@ -32,7 +32,7 @@ def generate_launch_description():
             name='push_manipulation_action_server',
             output='screen',
             emulate_tty=True,
-            prefix='xterm -e',
+            prefix='gnome-terminal --title=push_manipulation_action_server -- bash -c',
         ),
 
         # 4) visibility_action
@@ -42,6 +42,6 @@ def generate_launch_description():
             name='visibility_action',
             output='screen',
             emulate_tty=True,
-            prefix='xterm -e',
+            prefix='gnome-terminal --title=visibility_action -- bash -c',
         ),
     ])

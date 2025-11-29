@@ -18,7 +18,7 @@ It only:
   - computes a free corridor (+X/-X/+Y/-Y) around the box
   - returns side-peek poses and pre-manip pose based on that corridor
 """
-
+import time
 import math
 from typing import Optional, Tuple, Dict
 
@@ -133,6 +133,7 @@ class PushGeometryServer(Node):
         self.declare_parameter("robot_width", 0.50)
         self.declare_parameter("buffer_m", 0.10)
         self.declare_parameter("dir_order", ["+X", "-X", "+Y", "-Y"])
+        # self.declare_parameter("dir_order", ["+Y", "-Y", "+X", "-X"])
 
         self.declare_parameter("standoff_m", 0.50)
         self.declare_parameter("contact_gap_m", 0.06)
@@ -518,7 +519,12 @@ class PushGeometryServer(Node):
                 'cap':   L_star + margin,
             }
         """
-        if self.grid is None or self.robot_pose is None:
+        if self.grid is None or (self.robot_pose is None and self.odom_pose is None):
+            self.get_logger().info(
+                f"[DBG_PLAN_INPUT] robot_pose(amcl)={self.robot_pose}, odom_pose={self.odom_pose}, "
+                f"box(L,W)=({self.box['L']:.2f},{self.box['W']:.2f}) x,y=({self.box['x']:.2f},{self.box['y']:.2f})"
+            )
+
             return None
 
         occ = self._occ_bool()
@@ -582,6 +588,22 @@ class PushGeometryServer(Node):
             self.get_logger().warn(f"[VIZ] selected L* publish failed: {e}")
 
         return {"dir": chosen, "K": K, "W_dir": W_dir, "L_star": Ls, "cap": cap}
+    
+
+
+    def _wait_for_costmap_and_pose(self, timeout_sec: float = 1.0, sleep_sec: float = 0.05) -> bool:
+        """
+        Wait until costmap AND (AMCL pose OR odom pose) is available.
+        Returns True if available within timeout, else False.
+        """
+        t0 = time.time()
+        while (time.time() - t0) < timeout_sec:
+            if self.grid is not None and (self.robot_pose is not None or self.odom_pose is not None):
+                return True
+            time.sleep(sleep_sec)
+        return False
+
+
 
     # ------------------------------------------------------------------
     # Side-peek targets using _compute_plan
@@ -590,74 +612,160 @@ class PushGeometryServer(Node):
         self,
         box_x: float,
         box_y: float,
-        box_L: float,
-        box_W: float,
+        box_l: float,
+        box_w: float,
         peek_forward: float = 0.25,
-        extra_buffer_m: float = 0.25,
+        extra_buffer_m: float = 0.5,
     ):
         """
-        Use global costmap + box info to compute:
-          1) a free corridor dir via _compute_plan()
-          2) obstacle-side anchor near the box
-          3) LEFT / RIGHT side-peek poses beside the box.
+        Use global costmap + box info to compute, for **all free corridors**:
+          - corridor dir  (+X / -X / +Y / -Y)
+          - LEFT / RIGHT side-peek poses beside the box.
 
         Returns:
-            None    -> no costmap/pose or no free corridor
-            dict    -> { 'dir': str, 'left': (x,y,yaw), 'right': (x,y,yaw) }
+            None  -> no costmap/pose or no free corridor in any direction
+            list[dict] -> each dict = {
+                'dir': str,
+                'left':  (x, y, yaw),
+                'right': (x, y, yaw),
+                'l_star': float,
+            }
         """
-        # costmap and pose must be available
-        if self.grid is None or self.robot_pose is None:
+
+        # --- wait for costmap + pose ---
+        wait_sec = 5.0  # agar chaho to param bana sakte ho
+        if not self._wait_for_costmap_and_pose(timeout_sec=wait_sec):
             self.get_logger().warn(
-                "[SIDE_PEEK] No costmap/pose → cannot compute side-peek targets."
+                f"[SIDE_PEEK] No costmap/pose after waiting {wait_sec:.2f}s → cannot compute side-peek targets."
             )
             return None
 
-        # update box state for the current request (so _compute_plan uses it)
+        if self.robot_pose is None and self.odom_pose is not None:
+            self.get_logger().warn("[SIDE_PEEK] AMCL pose missing, using ODOM fallback.")
+
+        # --- update box state (so geometry helpers same data use karein) ---
         self.box["x"] = float(box_x)
         self.box["y"] = float(box_y)
-        self.box["L"] = float(box_L)
-        self.box["W"] = float(box_W)
+        self.box["L"] = float(box_l)
+        self.box["W"] = float(box_w)
 
-        plan = self._compute_plan()
-        if plan is None or "dir" not in plan:
+        # --- occupancy + robot / box extents ---
+        occ = self._occ_bool()
+        if occ is None:
+            return None
+
+        if self.odom_pose is not None:
+            rx, ry, ryaw = self.odom_pose
+        else:
+            rx, ry, ryaw = self.robot_pose
+
+        x_front, x_back, y_right, y_left = self._robot_extremes(rx, ry, ryaw)
+        xmin, xmax, ymin, ymax = self._box_extents()
+
+        # corridor length + width (same logic as _compute_plan)
+        K = max(1.5 * self.robot_L, 2.0)
+        W_fb = max(self.robot_W, self.box["W"])
+        W_lr = max(self.robot_L, self.box["L"])
+
+        def corridor_ok(tag: str):
+            """Return (center, yaw, W_dir) if corridor free, else None."""
+            if tag == "+X":
+                center = (xmax + 0.5 * K, self.box["y"])
+                yaw = 0.0
+                W = W_fb
+            elif tag == "-X":
+                center = (xmin - 0.5 * K, self.box["y"])
+                yaw = math.pi
+                W = W_fb
+            elif tag == "+Y":
+                center = (self.box["x"], ymax + 0.5 * K)
+                yaw = math.pi / 2.0
+                W = W_lr
+            elif tag == "-Y":
+                center = (self.box["x"], ymin - 0.5 * K)
+                yaw = -math.pi / 2.0
+                W = W_lr
+            else:
+                return None
+
+            if self._rect_free(occ, center, yaw, K, W):
+                return center, yaw, W
+            return None
+
+        buf_param = float(self.get_parameter("buffer_m").get_parameter_value().double_value)
+        targets = []
+
+        # dir_order param se direction ordering aa rahi hai (+X, -X, +Y, -Y ...)
+        for d in self.dir_order:
+            self.get_logger().info(f"[PLAN] Testing corridor {d} ...")
+            info = corridor_ok(d)
+            if info is None:
+                self.get_logger().info(f"[PLAN] Corridor {d} BLOCKED ❌")
+                continue
+
+            center, yaw_dir, W_dir = info
+            self.get_logger().info(f"[PLAN] Corridor {d} FREE ✅")
+
+            # usable free length L* (same helper as _compute_plan)
+            L_star = self._recompute_Lstar(
+                d, K, buf_param,
+                x_front, x_back, y_left, y_right,
+                xmin, xmax, ymin, ymax,
+            )
+            if L_star <= 0.0:
+                self.get_logger().info(
+                    f"[PLAN] Corridor {d} has non-positive L* ({L_star:.3f}) → skipping."
+                )
+                continue
+
+            # basis vectors for this dir
+            (_, _), yaw_dir = self._dir_unit_and_yaw(d)
+            fx, fy = math.cos(yaw_dir), math.sin(yaw_dir)   # forward (push direction)
+            ux, uy = -math.sin(yaw_dir), math.cos(yaw_dir)  # left (perpendicular)
+
+            # anchor point near obstacle (box center pushed slightly along push axis)
+            bx, by = box_x, box_y
+            ax = bx + peek_forward * fx
+            ay = by + peek_forward * fy
+
+            # corridor width depends on axis
+            if d in ("+X", "-X"):
+                corridor_w = max(self.robot_W, box_w)
+            else:
+                corridor_w = max(self.robot_L, box_l)
+
+            buf_eff = extra_buffer_m if (extra_buffer_m is not None) else buf_param
+            offset = 0.5 * corridor_w + 0.5 * self.robot_W + buf_eff
+
+            left = (ax + offset * ux, ay + offset * uy, yaw_dir)
+            right = (ax - offset * ux, ay - offset * uy, yaw_dir)
+
+            self.get_logger().info(
+                f"[SIDE_PEEK] dir={d}, "
+                f"L*={L_star:.3f} m, "
+                f"left=({left[0]:.2f},{left[1]:.2f},{math.degrees(left[2]):.1f}deg), "
+                f"right=({right[0]:.2f},{right[1]:.2f},{math.degrees(right[2]):.1f}deg)"
+            )
+
+            targets.append(
+                {
+                    "dir": d,
+                    "left": left,
+                    "right": right,
+                    "l_star": float(L_star),
+                }
+            )
+
+        if not targets:
             self.get_logger().warn(
-                "[SIDE_PEEK] _compute_plan returned None / no dir (no free corridor)."
+                "[SIDE_PEEK] No free corridor in any direction → cannot compute side-peek targets."
             )
             return None
 
-        plan_dir = plan["dir"]
-        self.get_logger().info(f"[SIDE_PEEK] Using plan_dir={plan_dir} from _compute_plan()")
+        return targets
 
-        # direction basis
-        (_, _), yaw_dir = self._dir_unit_and_yaw(plan_dir)
-        fx, fy = math.cos(yaw_dir), math.sin(yaw_dir)   # forward (push direction)
-        ux, uy = -math.sin(yaw_dir), math.cos(yaw_dir)  # left (perpendicular)
 
-        # anchor point near obstacle (box center pushed slightly along push axis)
-        bx, by = box_x, box_y
-        ax = bx + peek_forward * fx
-        ay = by + peek_forward * fy
 
-        # corridor width depends on axis
-        if plan_dir in ("+X", "-X"):
-            corridor_W = max(self.robot_W, box_W)
-        else:
-            corridor_W = max(self.robot_L, box_L)
-
-        buf_param = float(self.get_parameter("buffer_m").get_parameter_value().double_value)
-        buf = extra_buffer_m if (extra_buffer_m is not None) else buf_param
-        offset = 0.5 * corridor_W + 0.5 * self.robot_W + buf
-
-        left = (ax + offset * ux, ay + offset * uy, yaw_dir)
-        right = (ax - offset * ux, ay - offset * uy, yaw_dir)
-
-        self.get_logger().info(
-            f"[SIDE_PEEK] dir={plan_dir}, "
-            f"left=({left[0]:.2f},{left[1]:.2f},{math.degrees(left[2]):.1f}deg), "
-            f"right=({right[0]:.2f},{right[1]:.2f},{math.degrees(right[2]):.1f}deg)"
-        )
-
-        return {"dir": plan_dir, "left": left, "right": right}
 
     # ------------------------------------------------------------------
     # Pre-manip pose (pure geometry)
@@ -694,46 +802,69 @@ class PushGeometryServer(Node):
     def _handle_compute_side_peek_points(self, request, response):
         """
         Planner → box info.
-        Node → calls _compute_side_peek_targets and only returns poses + dir.
+        Node   → returns ALL valid side-peek poses for all free dirs.
         """
-        result = self._compute_side_peek_targets(
+        result_list = self._compute_side_peek_targets(
             box_x=request.box_x,
             box_y=request.box_y,
-            box_L=request.box_L,
-            box_W=request.box_W,
+            box_l=request.box_l,
+            box_w=request.box_w,
         )
 
-        if result is None:
-            self.get_logger().warn("[SIDE_PEEK] Could not compute side-peek targets.")
+        if not result_list:
+            self.get_logger().warn("[SIDE_PEEK] Could not compute any side-peek targets.")
             response.success = False
+            response.n = 0
             return response
 
-        plan_dir = result["dir"]
-        left = result["left"]
-        right = result["right"]
+        n = len(result_list)
+        self.get_logger().info(f"[SIDE_PEEK] Computed {n} side-peek dir candidates.")
 
         response.success = True
-        response.dir = plan_dir
+        response.n = n
 
-        response.left_x = float(left[0])
-        response.left_y = float(left[1])
-        response.left_yaw = float(left[2])
+        # Arrays clear / fill (ROS will init empty arrays by default)
+        response.dirs = []
+        response.left_x = []
+        response.left_y = []
+        response.left_yaw = []
+        response.right_x = []
+        response.right_y = []
+        response.right_yaw = []
+        response.l_star = []
 
-        response.right_x = float(right[0])
-        response.right_y = float(right[1])
-        response.right_yaw = float(right[2])
+        for t in result_list:
+            response.dirs.append(t["dir"])
+
+            lx, ly, lyaw = t["left"]
+            rx, ry, ryaw = t["right"]
+
+            response.left_x.append(float(lx))
+            response.left_y.append(float(ly))
+            response.left_yaw.append(float(lyaw))
+
+            response.right_x.append(float(rx))
+            response.right_y.append(float(ry))
+            response.right_yaw.append(float(ryaw))
+
+            response.l_star.append(float(t["l_star"]))
 
         return response
 
     def _handle_compute_pre_manip_pose(self, request, response):
         """
-        Planner → box_x, box_y, box_L, box_W, dir.
+        Planner → box_x, box_y, box_l, box_w, dir.
         Node   → uses _premanip_pose to compute pre-manip pose.
         """
+        # self.box["x"] = float(request.box_x)
+        # self.box["y"] = float(request.box_y)
+        # self.box["l"] = float(request.box_l)
+        # self.box["w"] = float(request.box_w)
         self.box["x"] = float(request.box_x)
         self.box["y"] = float(request.box_y)
-        self.box["L"] = float(request.box_L)
-        self.box["W"] = float(request.box_W)
+        self.box["L"] = float(request.box_l)
+        self.box["W"] = float(request.box_w)
+
 
         dtag = request.dir  # "+X" / "-X" / "+Y" / "-Y"
 

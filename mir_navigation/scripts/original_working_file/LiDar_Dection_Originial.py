@@ -155,6 +155,21 @@ class FixedMarkerNavigator(Node):
             marker_pose_base.pose.position.z,
         ], dtype=np.float64)
 
+        v_cam_to_marker = marker_p - cam_p
+        v_tool_to_marker = marker_p - tool_p
+        self.get_logger().info(
+            "[DBG_POS] marker_p(base)=(%.3f, %.3f, %.3f), cam_p=(%.3f, %.3f, %.3f), tool_p=(%.3f, %.3f, %.3f)"
+            % (marker_p[0], marker_p[1], marker_p[2],
+            cam_p[0], cam_p[1], cam_p[2],
+            tool_p[0], tool_p[1], tool_p[2])
+        )
+
+        self.get_logger().info(
+            "[DBG_VEC] v_cam_to_marker=(%.3f, %.3f, %.3f), v_tool_to_marker=(%.3f, %.3f, %.3f)"
+            % (v_cam_to_marker[0], v_cam_to_marker[1], v_cam_to_marker[2],
+            v_tool_to_marker[0], v_tool_to_marker[1], v_tool_to_marker[2])
+        )
+
         # Orientation to look-at marker: prefer camera optical Z, else tool +X
         use_camera_tf = False
         try:
@@ -179,6 +194,8 @@ class FixedMarkerNavigator(Node):
             v = marker_p - tool_p
             q = self._yaw_pitch_toolX_quat(v[0], v[1], v[2])
             R_w_t_des = R.from_quat(q).as_matrix()
+
+        
 
         q_des = R.from_matrix(R_w_t_des).as_quat()  # x,y,z,w
 

@@ -68,6 +68,7 @@ class YoloDetector(Node):
         # Accept string ("cpu", "cuda:0", "auto") or int (0/1/...)
         self.declare_parameter("device", "auto") #auto means decide yourself GPU or CPU. 
         self.declare_parameter("imgsz", 768)
+        # self.declare_parameter("imgsz", 640) #image size
         self.declare_parameter("conf", 0.35)
         self.declare_parameter("iou", 0.6)
         self.declare_parameter("publish_image", True)

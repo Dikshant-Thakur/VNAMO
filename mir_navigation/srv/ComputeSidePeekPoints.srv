@@ -1,16 +1,22 @@
-# Request
-float32 box_x
-float32 box_y
-float32 box_l
-float32 box_w
-
+# REQUEST  -------------------------------------------------
+float64 box_x      # obstacle center X (map frame)
+float64 box_y      # obstacle center Y (map frame)
+float64 box_l      # obstacle length (X side)
+float64 box_w      # obstacle width  (Y side)
 ---
-# Response
-bool   success
-string dir
-float64 left_x
-float64 left_y
-float64 left_yaw
-float64 right_x
-float64 right_y
-float64 right_yaw
+# RESPONSE -------------------------------------------------
+bool    success    # false => koi bhi side-peek point nahi mila
+
+uint32  n          # kitni directions bhej rahe hain (0..n-1)
+
+string[] dirs      # size = n, e.g. "+X", "-X", "+Y", "-Y"
+
+float64[] left_x   # size = n
+float64[] left_y   # size = n
+float64[] left_yaw # size = n (radians)
+
+float64[] right_x  # size = n
+float64[] right_y  # size = n
+float64[] right_yaw# size = n (radians)
+
+float64[] l_star   # size = n, usable corridor length per dir

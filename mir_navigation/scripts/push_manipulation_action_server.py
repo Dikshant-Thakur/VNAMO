@@ -13,9 +13,13 @@ from rclpy.action import ActionServer, GoalResponse, CancelResponse
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan 
 
 # 👉 tumhara actual action type
 from mir_navigation.action import ManipulateObstacle
+
+from rclpy.qos import qos_profile_sensor_data
+
 
 
 @dataclass
@@ -50,9 +54,11 @@ class ManipulateObstacleServer(Node):
         self.declare_parameter('push_distance_m',         1.0)   # how far to push
         self.declare_parameter('retract_distance_m',      0.5)   # how far to go back
 
-        self.declare_parameter('contact_timeout_s',       20.0)
+        self.declare_parameter('contact_timeout_s',       30.0)
         self.declare_parameter('push_timeout_s',          120.0)
         self.declare_parameter('retract_timeout_s',       20.0)
+
+        self.declare_parameter('contact_range_threshold', 0.4)  # meters
 
         # (optional) known obstacles (abhi sirf names, pose/size use nahi)
         self._obstacles: Dict[str, ObstacleInfo] = {
@@ -61,12 +67,22 @@ class ManipulateObstacleServer(Node):
 
         # ---------- State ----------
         self.odom_pose: Optional[Tuple[float, float, float]] = None
+        self.last_scan: Optional[LaserScan] = None
 
         # ---------- ROS I/O ----------
         self.odom_sub = self.create_subscription(
-            Odometry, '/odom', self._odom_cb, 10
+            Odometry, '/diff_cont/odom', self._odom_cb, 10
         )
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self._scan_cb,
+            qos_profile=qos_profile_sensor_data,   # ✅ important
+        )
+
+
+        self.cmd_vel_pub = self.create_publisher(Twist, '/diff_cont/cmd_vel_unstamped', 10)
 
         # Action server
         self._action_server = ActionServer(
@@ -79,6 +95,52 @@ class ManipulateObstacleServer(Node):
         )
 
         self.get_logger().info('[MANIP] ManipulateObstacleServer up (push-only, cmd_vel based).')
+
+
+
+        # ------------------------------------------------------------------
+    # Laser callbacks / helpers
+    # ------------------------------------------------------------------
+    def _scan_cb(self, msg: LaserScan):
+        self.last_scan = msg
+
+    def _get_front_min_range(self, fov_deg: float = 20.0) -> Optional[float]:
+        """
+        Return min range in a small cone in front of robot from /scan.
+        Ignores inf/NaN/zero.
+        """
+        scan = self.last_scan
+        if scan is None or not scan.ranges:
+            return None
+
+        n = len(scan.ranges)
+        center_idx = n // 2
+
+        # how many beams to each side for given FOV
+        half_fov_rad = math.radians(fov_deg) * 0.5
+        if scan.angle_increment <= 0.0:
+            window = n // 8
+        else:
+            window = int(half_fov_rad / abs(scan.angle_increment))
+        window = max(1, min(window, n // 2))
+
+        i0 = max(0, center_idx - window)
+        i1 = min(n - 1, center_idx + window)
+
+        vals = []
+        for r in scan.ranges[i0 : i1 + 1]:
+            if r is None:
+                continue
+            if math.isinf(r) or math.isnan(r):
+                continue
+            if r <= 0.0:
+                continue
+            vals.append(r)
+
+        if not vals:
+            return None
+        return min(vals)
+    
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -120,7 +182,7 @@ class ManipulateObstacleServer(Node):
     # Execute
     # ------------------------------------------------------------------
 
-    async def execute_callback(self, goal_handle):
+    def execute_callback(self, goal_handle):
         """
         Simple pipeline:
           1) Wait for odom.
@@ -139,7 +201,7 @@ class ManipulateObstacleServer(Node):
         )
 
         # 1) Wait for odom
-        if not await self._wait_for_odom(goal_handle):
+        if not self._wait_for_odom(goal_handle):
             msg = "[MANIP] No odom data. Aborting."
             self.get_logger().warn(msg)
             result.success = False
@@ -151,7 +213,7 @@ class ManipulateObstacleServer(Node):
         feedback.state = "approach_contact"
         goal_handle.publish_feedback(feedback)
 
-        ok_contact = await self._approach_contact(goal_handle)
+        ok_contact = self._approach_contact(goal_handle)
         if not ok_contact:
             msg = "[MANIP] Contact approach failed."
             self.get_logger().warn(msg)
@@ -171,7 +233,7 @@ class ManipulateObstacleServer(Node):
         feedback.state = "pushing"
         goal_handle.publish_feedback(feedback)
 
-        ok_push = await self._do_push(goal_handle)
+        ok_push = self._do_push(goal_handle)
         if not ok_push:
             msg = "[MANIP] Push failed."
             self.get_logger().warn(msg)
@@ -191,7 +253,7 @@ class ManipulateObstacleServer(Node):
         feedback.state = "retract"
         goal_handle.publish_feedback(feedback)
 
-        await self._retract(goal_handle)
+        self._retract(goal_handle)
 
         feedback.state = "done"
         goal_handle.publish_feedback(feedback)
@@ -207,7 +269,7 @@ class ManipulateObstacleServer(Node):
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _wait_for_odom(self, goal_handle, timeout_s: float = 5.0) -> bool:
+    def _wait_for_odom(self, goal_handle, timeout_s: float = 5.0) -> bool:
         t0 = time.monotonic()
         while rclpy.ok():
             if self.odom_pose is not None:
@@ -216,26 +278,38 @@ class ManipulateObstacleServer(Node):
                 return False
             if (time.monotonic() - t0) > timeout_s:
                 return False
-            await asyncio.sleep(0.1)
+            time.sleep(0.1)
         return False
 
-    async def _approach_contact(self, goal_handle) -> bool:
+    def _approach_contact(self, goal_handle) -> bool:
         """
-        Fake contact approach:
+        Real contact approach:
           - move forward at contact_approach_speed
-          - for contact_approach_time_s (or until timeout / cancel)
+          - stop when front laser distance <= contact_range_threshold
+          - or timeout / cancel
         """
-        speed = float(self.get_parameter('contact_approach_speed').get_parameter_value().double_value)
-        contact_time = float(self.get_parameter('contact_approach_time_s').get_parameter_value().double_value)
-        timeout = float(self.get_parameter('contact_timeout_s').get_parameter_value().double_value)
+        speed = float(
+            self.get_parameter('contact_approach_speed')
+            .get_parameter_value().double_value
+        )
+        timeout = float(
+            self.get_parameter('contact_timeout_s')
+            .get_parameter_value().double_value
+        )
+        thr = float(
+            self.get_parameter('contact_range_threshold')
+            .get_parameter_value().double_value
+        )
 
-        self.get_logger().info(f"[MANIP] Approach contact: ~{contact_time:.1f}s at {speed:.2f} m/s.")
+        self.get_logger().info(
+            f"[MANIP] Approach contact (laser-based): threshold={thr:.3f} m "
+            f"at {speed:.2f} m/s."
+        )
 
         cmd = Twist()
         cmd.linear.x = speed
 
         t0 = time.monotonic()
-        t_contact = t0 + contact_time
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -243,20 +317,30 @@ class ManipulateObstacleServer(Node):
                 return False
 
             now = time.monotonic()
-            if now >= t_contact:
-                break
             if (now - t0) > timeout:
-                self.get_logger().warn("[MANIP] Approach timeout.")
+                self.get_logger().warn("[MANIP] Approach timeout (no contact).")
                 self._stop_robot()
                 return False
 
+            d_min = self._get_front_min_range()
+            if d_min is not None:
+                # DEBUG (optional):
+                self.get_logger().info(f"[MANIP] front min range={d_min:.3f} m")
+                if d_min <= thr:
+                    self.get_logger().info(
+                        f"[MANIP] Contact reached at front range={d_min:.3f} m."
+                    )
+                    self._stop_robot()
+                    return True
+
             self.cmd_vel_pub.publish(cmd)
-            await asyncio.sleep(0.05)
+            time.sleep(0.05)
 
         self._stop_robot()
-        return True
+        return False
 
-    async def _do_push(self, goal_handle) -> bool:
+
+    def _do_push(self, goal_handle) -> bool:
         """
         Push forward for push_distance_m using odom.
         """
@@ -264,10 +348,11 @@ class ManipulateObstacleServer(Node):
             self.get_logger().warn("[MANIP] No odom for push.")
             return False
 
-        push_dist = float(self.get_parameter('push_distance_m').get_parameter_value().double_value)
+        # push_dist = float(self.get_parameter('push_distance_m').get_parameter_value().double_value)
+        push_dist = float(goal_handle.request.push_dist_m)
         speed = float(self.get_parameter('push_speed').get_parameter_value().double_value)
         timeout = float(self.get_parameter('push_timeout_s').get_parameter_value().double_value)
-
+        push_dist = float(goal_handle.request.push_dist_m)
         self.get_logger().info(
             f"[MANIP] Pushing forward: distance={push_dist:.2f} m at {speed:.2f} m/s."
         )
@@ -285,7 +370,7 @@ class ManipulateObstacleServer(Node):
                 return False
 
             self.cmd_vel_pub.publish(cmd)
-            await asyncio.sleep(0.05)
+            time.sleep(0.05)
 
             if self.odom_pose is None:
                 continue
@@ -305,7 +390,7 @@ class ManipulateObstacleServer(Node):
         self.get_logger().info(f"[MANIP] Push done, moved ~{moved:.2f} m.")
         return True
 
-    async def _retract(self, goal_handle) -> None:
+    def _retract(self, goal_handle) -> None:
         """
         Go backward for retract_distance_m using odom.
         """
@@ -333,7 +418,7 @@ class ManipulateObstacleServer(Node):
                 break
 
             self.cmd_vel_pub.publish(cmd)
-            await asyncio.sleep(0.05)
+            time.sleep(0.05)
 
             if self.odom_pose is None:
                 continue
@@ -365,7 +450,9 @@ def main(args=None):
     rclpy.init(args=args)
     node = ManipulateObstacleServer()
     try:
-        rclpy.spin(node)
+        executor = rclpy.executors.MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     node.destroy_node()

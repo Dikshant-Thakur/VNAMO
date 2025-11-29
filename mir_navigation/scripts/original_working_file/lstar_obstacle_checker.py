@@ -190,7 +190,7 @@ class LStarObstacleChecker(Node):
         self._last_cloud_stamp_ns: Optional[int] = None
 
         qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10,
             durability=QoSDurabilityPolicy.VOLATILE,

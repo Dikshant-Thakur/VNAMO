@@ -1,5 +1,6 @@
 string obstacle_name
 string push_dir
+float32 push_dist_m 
 
 ---
 bool success

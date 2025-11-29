@@ -26,6 +26,8 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from visualization_msgs.msg import Marker
 
+from rclpy.qos import qos_profile_sensor_data
+
 import tf2_ros
 from geometry_msgs.msg import (
     PoseStamped,
@@ -33,6 +35,7 @@ from geometry_msgs.msg import (
     Vector3,
     TransformStamped,
 )
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from rclpy.action import ActionServer, ActionClient
 from moveit_msgs.action import MoveGroup
@@ -134,6 +137,10 @@ class VisibilityActionServer(Node):
 
     def __init__(self):
         super().__init__("visibility_action_server")
+        self.set_parameters([rclpy.parameter.Parameter(
+            "use_sim_time", rclpy.Parameter.Type.BOOL, True
+        )])
+        
 
         # ---- Obstacle database (local) ----
         self.obstacles = {
@@ -152,10 +159,6 @@ class VisibilityActionServer(Node):
             # yahan future obstacles add kar sakte ho
         }
 
-
-
-
-
         # Work-state
         self._job_active = False
         self._job_cancel = False
@@ -167,10 +170,15 @@ class VisibilityActionServer(Node):
         self._cloud_rx_count = 0
         self._last_age_log_ns = 0
 
+        # ✅ MoveIt result + repeat-pose guard
+        self._last_move_ok: bool = True
+        self._last_target_xy = None          # np.array([x,y]) in MAP
+        self._last_target_fail_count: int = 0
+
         # Reentrant group for service, timer, action
         self.cbgroup = ReentrantCallbackGroup()
 
-        # === Params === (copied / aligned with LStar + push orchestrator)
+        # === Params ===
         self.camera_hfov_deg = float(self.declare_parameter("camera_hfov_deg", 60.0).value)
         self.camera_vfov_deg = float(self.declare_parameter("camera_vfov_deg", 45.0).value)
 
@@ -191,7 +199,7 @@ class VisibilityActionServer(Node):
         self.declare_parameter("min_obst_pts", 500)
         self.declare_parameter("z_free_max", 0.15)
         self.declare_parameter("z_max_clip", 2.50)
-        self.declare_parameter("stale_cloud_sec", 2.5)
+        self.declare_parameter("stale_cloud_sec", 5.0)
         self.declare_parameter("max_points_process", 120000)
         self.declare_parameter("marker_ns", "lstar_roi")
 
@@ -237,14 +245,18 @@ class VisibilityActionServer(Node):
         self._last_cloud_msg: Optional[PointCloud2] = None
         self._last_cloud_stamp_ns: Optional[int] = None
 
-        qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
-            durability=QoSDurabilityPolicy.VOLATILE,
-        )
+        # ✅ FIX 1: sensor-style VOLATILE QoS (ignore old latched clouds)
+        cloud_qos = qos_profile_sensor_data
+        cloud_qos.depth = 1
+        cloud_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
+        cloud_qos.durability = QoSDurabilityPolicy.VOLATILE
+
         self.cloud_sub = self.create_subscription(
-            PointCloud2, self.cloud_topic, self._on_cloud, qos_profile=qos_profile, callback_group=self.cbgroup
+            PointCloud2,
+            self.cloud_topic,
+            self._on_cloud,
+            qos_profile=cloud_qos,
+            callback_group=self.cbgroup
         )
 
         # Marker pub
@@ -280,28 +292,15 @@ class VisibilityActionServer(Node):
 
     # ---------- L* / corridor helpers ----------
     def _compute_lstar_length(self, box_L: float, box_W: float) -> float:
-        """
-        Simplified K calculation:
-        - Enough room = robot length + box length + 2*buffer
-        - But at least default_lstar_min
-        """
         K = self.robot_L + box_L + 2.0 * self.buffer_m
         return max(K, self.default_lstar_min)
 
     def _compute_corridor_roi(self, box_x, box_y, box_L, box_W, dir_tag: str, K: float):
-        """
-        Reuse push-style corridor logic:
-        - anchor at obstacle face
-        - ROI center at half of K from anchor
-        - corridor width = max(robot_dim, box_dim) depending on direction
-        """
         (ux, uy), yaw = dir_unit_and_yaw(dir_tag)
 
-        # box center
         box_cx = float(box_x)
         box_cy = float(box_y)
 
-        # anchor on obstacle face along direction
         if dir_tag in ("+X", "-X"):
             anchor_x = box_cx + 0.5 * box_L * ux
             anchor_y = box_cy
@@ -311,7 +310,6 @@ class VisibilityActionServer(Node):
             anchor_y = box_cy + 0.5 * box_W * uy
             corridor_width = max(self.robot_L, box_L)
 
-        # ROI center
         region_cx = anchor_x + 0.5 * K * ux
         region_cy = anchor_y + 0.5 * K * uy
 
@@ -350,7 +348,6 @@ class VisibilityActionServer(Node):
             self.get_logger().error("[VIEW] Missing cam<->ee TF")
             return None
 
-        # Current camera or EE position in planning frame
         try:
             tf_cam_now = self.tf_buffer.lookup_transform(
                 planning_frame, self.CAMERA_OPTICAL_FRAME, rclpy.time.Time(), timeout=Duration(seconds=0.75)
@@ -376,7 +373,6 @@ class VisibilityActionServer(Node):
                 dtype=float,
             )
 
-        # Build desired camera frame: +Z toward target; choose orthonormal x,y
         z_cam = target_w - cam_pos_now
         nz = np.linalg.norm(z_cam)
         if nz < 1e-9:
@@ -388,7 +384,6 @@ class VisibilityActionServer(Node):
             up = np.array([0.0, 1.0, 0.0], dtype=float)
         x_cam = np.cross(up, z_cam); x_cam /= (np.linalg.norm(x_cam) + 1e-9)
         y_cam = np.cross(z_cam, x_cam)
-        # Empirical axis flip for camera convention
         y_cam = -y_cam
         x_cam = -x_cam
 
@@ -399,11 +394,10 @@ class VisibilityActionServer(Node):
             U[:, -1] *= -1.0
             R_w_cam = U @ Vt
 
-        # Compose world<-cam and then world<-ee
         T_w_cam = np.eye(4, dtype=float)
         T_w_cam[:3, :3] = R_w_cam
         T_w_cam[:3, 3] = cam_pos_now
-        T_w_ee = T_w_cam @ self.T_cam_ee  # (W<-CAM) * (CAM<-EE) = W<-EE
+        T_w_ee = T_w_cam @ self.T_cam_ee
 
         ps = PoseStamped()
         ps.header.frame_id = planning_frame
@@ -418,19 +412,36 @@ class VisibilityActionServer(Node):
         ps.pose.orientation.w = float(qw)
         return ps
 
-    def _build_orient_only_goal_from_pose(self, pose_stamped: PoseStamped) -> MoveGroup.Goal:
+    def _build_orient_only_goal_from_pose(
+        self,
+        pose_stamped: PoseStamped,
+        relaxed: bool = False,
+    ) -> MoveGroup.Goal:
+        """
+        relaxed=False  -> normal (tight) tolerances
+        relaxed=True   -> MoveIt tolerances thode loose
+        """
+        if relaxed:
+            ori_tol_deg = 15.0      # pehle 5 deg tha
+            pos_radius_m = 0.08     # pehle 0.02 m tha
+            plan_time = 3.0
+        else:
+            ori_tol_deg = 5.0
+            pos_radius_m = 0.02
+            plan_time = 2.0
+
         oc = OrientationConstraint()
         oc.header = pose_stamped.header
         oc.link_name = self.ee_link
         oc.orientation = pose_stamped.pose.orientation
-        oc.absolute_x_axis_tolerance = math.radians(5.0)
-        oc.absolute_y_axis_tolerance = math.radians(5.0)
-        oc.absolute_z_axis_tolerance = math.radians(5.0)
+        oc.absolute_x_axis_tolerance = math.radians(ori_tol_deg)
+        oc.absolute_y_axis_tolerance = math.radians(ori_tol_deg)
+        oc.absolute_z_axis_tolerance = math.radians(ori_tol_deg)
         oc.weight = 1.0
 
         sphere = SolidPrimitive()
         sphere.type = SolidPrimitive.SPHERE
-        sphere.dimensions = [0.02]  # 2 cm position lock radius
+        sphere.dimensions = [pos_radius_m]
 
         center = Pose()
         center.position = pose_stamped.pose.position
@@ -454,7 +465,7 @@ class VisibilityActionServer(Node):
         req = MotionPlanRequest()
         req.group_name = self.moveit_group_name
         req.goal_constraints = [cons]
-        req.allowed_planning_time = 2.0
+        req.allowed_planning_time = plan_time
         req.num_planning_attempts = 1
 
         opts = PlanningOptions()
@@ -467,18 +478,55 @@ class VisibilityActionServer(Node):
         goal.planning_options = opts
         return goal
 
-    def _build_orient_only_goal_to(self, xy):
+    def _build_orient_only_goal_to(self, xy, relaxed: bool = False):
         cam_z = 0.0
         px, py, pz = self._transform_point_xy(
             xy[0], xy[1], from_frame=self.target_frame, to_frame=self.planning_frame
         )
         target = np.array([float(px), float(py), cam_z], dtype=float)
         pose_ee = self._ee_pose_orient_only(target, self.planning_frame)
-        return self._build_orient_only_goal_from_pose(pose_ee)
+
+        # ✅ FIX 4: guard against None
+        if pose_ee is None:
+            return None
+
+        return self._build_orient_only_goal_from_pose(pose_ee, relaxed=relaxed)
+
 
     def _schedule_orient_to_point(self, xy):
-        self.get_logger().info(f"[VIEW] scheduling next look-at xy=({float(xy[0]):.2f}, {float(xy[1]):.2f})")
-        goal = self._build_orient_only_goal_to(xy)
+        # xy ko np.array bana lo (MAP frame me)
+        xy = np.asarray(xy, dtype=float).reshape(2,)
+
+        # ----- Repeat-pose guard -----
+        # Pichle target se distance
+        if self._last_target_xy is not None:
+            dist = float(np.linalg.norm(xy - self._last_target_xy))
+        else:
+            dist = float("inf")
+
+        # Agar same pose ke aas-paas hai aur last move FAIL tha → fail_count++
+        if dist < 1e-3 and not getattr(self, "_last_move_ok", True):
+            self._last_target_fail_count += 1
+        else:
+            self._last_target_fail_count = 0
+
+        self._last_target_xy = xy.copy()
+
+        # Agar 1 se zyada baar FAIL ho chuka → relaxed tolerances use karo
+        use_relaxed = self._last_target_fail_count >= 1
+        if use_relaxed:
+            self.get_logger().warn(
+                f"[VIEW] Same target failed {self._last_target_fail_count} times; "
+                f"using RELAXED MoveIt tolerances for this goal."
+            )
+
+        self.get_logger().info(
+            f"[VIEW] scheduling next look-at xy=({float(xy[0]):.2f}, {float(xy[1]):.2f})"
+        )
+        goal = self._build_orient_only_goal_to(xy, relaxed=use_relaxed)
+        if goal is None:
+            self.get_logger().warn("[VIEW] orient goal None, skipping step")
+            return False
         with self._move_lock:
             self._move_future = self.movegroup_ac.send_goal_async(goal)
             self._result_future = None
@@ -503,6 +551,8 @@ class VisibilityActionServer(Node):
                     self._move_future = None
                     self._result_future = None
                     self._move_goal_active = False
+                    # ✅ rejected ko FAIL treat karo
+                    self._last_move_ok = False
                     return True
                 self._result_future = goal_handle.get_result_async()
                 self.get_logger().info("[MOVE] Goal accepted; waiting for result...")
@@ -515,6 +565,7 @@ class VisibilityActionServer(Node):
             if rf is not None and rf.done():
                 res = rf.result()
                 ok = (res is not None) and (res.result.error_code.val == 1)
+                self._last_move_ok = bool(ok)   # ✅ yahan save
                 self.get_logger().info(f"[MOVE] Done: {'OK' if ok else 'FAIL'}")
                 self._move_future = None
                 self._result_future = None
@@ -526,13 +577,29 @@ class VisibilityActionServer(Node):
     # ---------- Cloud ----------
     def _on_cloud(self, msg: PointCloud2):
         self._last_cloud_msg = msg
+
         try:
             t = rclpy.time.Time.from_msg(msg.header.stamp)
-            self._last_cloud_stamp_ns = t.nanoseconds
+            stamp_ns = t.nanoseconds
         except Exception:
-            self._last_cloud_stamp_ns = self.get_clock().now().nanoseconds
-        self._cloud_rx_count += 1
+            stamp_ns = 0
+
         now_ns = self.get_clock().now().nanoseconds
+
+        # ✅ FIX 2: stamp sanity (0 or absurd age)
+        if stamp_ns == 0:
+            stamp_ns = now_ns
+        else:
+            age_s = (now_ns - stamp_ns) / 1e9
+            if age_s > 3600.0 or age_s < -5.0:
+                self.get_logger().warn(
+                    f"[CLOUD] Bad stamp detected (age={age_s:.1f}s). Overriding with now()."
+                )
+                stamp_ns = now_ns
+
+        self._last_cloud_stamp_ns = stamp_ns
+        self._cloud_rx_count += 1
+
         if now_ns - self._last_age_log_ns > 1e9:
             self._last_age_log_ns = now_ns
 
@@ -574,10 +641,6 @@ class VisibilityActionServer(Node):
 
     # ---------- Coverage / ROI ----------
     def _eval_roi(self, P_map, cx, cy, L, W, yaw_rad):
-        """
-        Returns roi_pts, observed_cells, vis_ratio, obst_pts, (xp, yp, inside, grid)
-        Obstacle = z > z_free_max (and outside box footprint)
-        """
         fp_margin = 0.15
         cell = max(1e-3, float(self.grid_cell_m))
         grid_nx = max(1, int(math.ceil(float(L) / cell)))
@@ -587,10 +650,8 @@ class VisibilityActionServer(Node):
             self.get_logger().warn("[FAILURE] No valid points found in transformed cloud.")
             return 0, 0, 0.0, 0, None
 
-        # ROI marker
         self._publish_roi_marker(cx, cy, L, W, yaw_rad, color=(0.9, 0.8, 0.1, 0.35))
 
-        # World -> ROI-local
         dx = P_map[:, 0] - float(cx)
         dy = P_map[:, 1] - float(cy)
         c = np.cos(-yaw_rad)
@@ -602,7 +663,6 @@ class VisibilityActionServer(Node):
         halfW = 0.5 * float(W)
         inside_roi = (np.abs(xp) < halfL) & (np.abs(yp) < halfW)
 
-        # Exclude box footprint (map-aligned)
         try:
             box_cx, box_cy, box_L, box_W = self._box_fp
         except Exception:
@@ -613,15 +673,12 @@ class VisibilityActionServer(Node):
         inside_fp = (np.abs(P_map[:, 0] - box_cx) <= hx) & (np.abs(P_map[:, 1] - box_cy) <= hy)
         inside = inside_roi & (~(inside_roi & inside_fp))
 
-        # Debug point markers
         self._publish_inside_points(P_map, inside, color=(0.0, 0.5, 1.0, 0.9), max_points=5000)
 
-        # Obstacle points
         obst_mask = inside & (P_map[:, 2] > float(self.z_free_max))
         obst_pts = int(np.count_nonzero(obst_mask))
         self._publish_obstacle_points(P_map, inside, self.z_free_max, color=(1.0, 0.0, 0.0, 1.0), max_points=5000)
 
-        # Visibility grid
         roi_pts = int(np.count_nonzero(inside))
         grid = np.zeros((grid_nx, grid_ny), dtype=bool)
         observed_cells = 0
@@ -643,12 +700,6 @@ class VisibilityActionServer(Node):
         return (xw, yw)
 
     def _compute_roi_coverage(self, Pm):
-        """
-        Returns:
-          coverage_sim: float in [0,1]
-          next_xy_map:  np.array([x,y]) or None
-          obst_pts:     int (obstacle points inside ROI excluding footprint)
-        """
         if Pm is None or Pm.size == 0:
             if getattr(self, "_cov_grid", None) is not None:
                 cov = float(self._cov_grid.sum()) / float(self._cov_grid.size)
@@ -675,7 +726,6 @@ class VisibilityActionServer(Node):
         yc = (np.arange(ny) + 0.5) * dy - 0.5 * float(W)
         Xc, Yc = np.meshgrid(xc, yc, indexing="ij")
 
-        # Valid mask (exclude box footprint area in ROI-local)
         valid_mask = np.ones_like(self._cov_grid, dtype=bool)
         try:
             box_cx_map, box_cy_map, box_L, box_W = self._box_fp
@@ -821,7 +871,6 @@ class VisibilityActionServer(Node):
             self._move_goal_active = False
 
     def _finish_success(self, coverage: float):
-        # DECISION: obstacle present if seen OR insufficient coverage
         blocked = bool(self._obst_detected) or (coverage < float(self.vis_ok_thresh))
         self._last_result_blocked = blocked
         self.get_logger().info(
@@ -865,7 +914,7 @@ class VisibilityActionServer(Node):
         if pose_ee is None:
             self.get_logger().warn("[VIEW] Could not compute EE pose")
             return False
-        goal = self._build_orient_only_goal_from_pose(pose_ee)
+        goal = self._build_orient_only_goal_from_pose(pose_ee, relaxed=False)
         with self._move_lock:
             self._move_future = self.movegroup_ac.send_goal_async(goal)
             self._result_future = None
@@ -882,7 +931,6 @@ class VisibilityActionServer(Node):
         Pm = self._get_cloud_in_map_nonblocking()
         cov, centroid, obst_pts = self._compute_roi_coverage(Pm)
 
-        # Update obstacle flag
         if int(obst_pts) >= int(self.min_obst_pts):
             if not self._obst_detected:
                 self.get_logger().warn(f"[OBST] Detected {obst_pts} pts (>={self.min_obst_pts}) in ROI.")
@@ -895,7 +943,6 @@ class VisibilityActionServer(Node):
         roi_marker = self._make_roi_marker(Pm, cov)
         self.marker_pub.publish(roi_marker)
 
-        # Early stop if obstacle confirmed and we have minimum confidence
         if self._obst_detected and cov >= float(self.vis_min_thresh):
             self.get_logger().info(
                 f"[CHECK] Early stop: obstacle observed and coverage >= vis_min_thresh "
@@ -944,7 +991,6 @@ class VisibilityActionServer(Node):
                     self.get_logger().warn("[CHECK] Waiting for fresh cloud...")
                     return
 
-                # If early stop condition met
                 if next_xy is None:
                     self._finish_success(coverage)
                     return
@@ -969,14 +1015,6 @@ class VisibilityActionServer(Node):
 
     # ---------- Action execute ----------
     def execute_visibility(self, goal_handle):
-        """
-        Action callback: compute L* corridor + run visibility scan
-        Now the client only sends:
-          - obstacle_name
-          - vis_dir
-          - duration_sec
-        Box geometry yahan local dictionary se aata hai.
-        """
         goal = goal_handle.request
 
         self.get_logger().info(
@@ -984,7 +1022,6 @@ class VisibilityActionServer(Node):
             f"dir={goal.vis_dir} dur={goal.duration_sec:.1f}s"
         )
 
-        # 0) Look up obstacle geometry locally
         obst_name = (goal.obstacle_name or "").strip()
         if not obst_name:
             self.get_logger().warn("[ACT] Empty obstacle_name in goal, aborting.")
@@ -1013,7 +1050,6 @@ class VisibilityActionServer(Node):
             f"pos=({box_x:.2f},{box_y:.2f}), size=({box_L:.2f} x {box_W:.2f})"
         )
 
-        # If already busy, reject
         if self._job_active:
             self.get_logger().warn("[ACT] Busy; rejecting new goal.")
             result = CheckVisibility.Result()
@@ -1021,11 +1057,21 @@ class VisibilityActionServer(Node):
             goal_handle.abort()
             return result
 
-        # 1) Compute K (L*)
+        # ✅ FIX 3: wait briefly for a fresh cloud before starting job
+        start_wait = time.monotonic()
+        while (time.monotonic() - start_wait) < 2.0 and not self._is_cloud_fresh(self.stale_cloud_s):
+            time.sleep(0.05)
+
+        if not self._is_cloud_fresh(self.stale_cloud_s):
+            self.get_logger().warn("[ACT] No fresh cloud even after wait -> abort blocked=True")
+            result = CheckVisibility.Result()
+            result.obstacle_present = True
+            goal_handle.abort()
+            return result
+
         K = self._compute_lstar_length(box_L, box_W)
         self.get_logger().info(f"[ACT] Computed L* corridor length K={K:.2f} m")
 
-        # 2) Corridor / ROI geometry from box + dir
         cx, cy, L, W, yaw = self._compute_corridor_roi(
             box_x=box_x,
             box_y=box_y,
@@ -1038,7 +1084,6 @@ class VisibilityActionServer(Node):
             f"[ACT] ROI center=({cx:.2f},{cy:.2f}) L={L:.2f} W={W:.2f} yaw={math.degrees(yaw):.1f}°"
         )
 
-        # 3) Init job state
         self._reset_motion_handles()
         self._last_result_blocked = True
         self._job_done_evt.clear()
@@ -1050,7 +1095,6 @@ class VisibilityActionServer(Node):
 
         self._job_deadline_monotonic = time.monotonic() + float(goal.duration_sec)
 
-        # ROI + box footprint for coverage
         self._roi_rect = (float(cx), float(cy), float(L), float(W))
         self._box_fp = (
             float(box_x),
@@ -1072,7 +1116,6 @@ class VisibilityActionServer(Node):
 
         self.get_logger().info("[ACT] Job initialized; waiting for completion...")
 
-        # 4) Wait for job completion
         hard_timeout_s = float(goal.duration_sec) + 3.0
         self._job_done_evt.wait(timeout=hard_timeout_s)
         self._job_done_evt.clear()
@@ -1092,7 +1135,6 @@ class VisibilityActionServer(Node):
             self.get_logger().info("[ACT] Done: area clear")
 
         return result
-
 
 
 # ---------- main ----------
