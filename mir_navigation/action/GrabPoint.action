@@ -1,0 +1,7 @@
+# Goal: ready-made grasp pose, already expressed in /map (ya jo bhi frame client de)
+geometry_msgs/PoseStamped target_pose
+---
+# Result: bas success / failure + optional message
+bool success
+
+---

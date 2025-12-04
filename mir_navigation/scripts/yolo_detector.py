@@ -61,7 +61,7 @@ class YoloDetector(Node):
         self.pub_label = self.create_publisher(String, "/yolo/label", 10)
 
         # ---------------- Parameters ----------------
-        self.declare_parameter("model_path", "/home/dikki/runs/detect/movable_finetune768/weights/best.pt")
+        self.declare_parameter("model_path", "/home/dikki/runs/detect/movable_push_pull_2class/weights/best.pt")
         self.declare_parameter(
             "image_topic", "/realsense/camera/color/image_raw/compressed"
         )
@@ -108,6 +108,7 @@ class YoloDetector(Node):
         )
 
         self.enabled = False
+        # self.enabled = True
         self._gate_logged = False
 
         # ---------------- Model ----------------
