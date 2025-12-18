@@ -1,0 +1,36 @@
+#################################
+# Servo Config for UR5
+#################################
+moveit_servo:
+  ros__parameters:  # <--- YE LINE MISSING THI
+    use_gazebo: true
+
+    move_group_name: ur5_manip
+
+    # Frames
+    robot_link_command_frame: ur_base_link
+    planning_frame: ur_base_link
+    ee_frame: ur_tool0
+
+    # Topic to Publish Joint Velocities
+    command_out_topic: /joint_group_velocity_controller/commands
+    command_out_type: std_msgs/Float64MultiArray
+
+    publish_joint_positions: false
+    publish_joint_velocities: true
+    publish_joint_accelerations: false
+
+    # Dynamics
+    publish_period: 0.033  # 30Hz
+    incoming_command_timeout: 0.1
+    
+    # Movement Properties
+    linear_scale: 1.0
+    rotational_scale: 1.0
+    joint_scale: 1.0
+
+    # Safety
+    lower_singularity_threshold: 5.0
+    hard_stop_singularity_threshold: 10.0
+    check_collisions: false
+    low_pass_filter_coeff: 2.0

@@ -46,7 +46,7 @@
   <test_depend>ament_lint_common</test_depend>
 
   
-
+  <exec_depend>moveit_servo</exec_depend>
 
   <depend>moveit_msgs</depend>
   <depend>shape_msgs</depend>

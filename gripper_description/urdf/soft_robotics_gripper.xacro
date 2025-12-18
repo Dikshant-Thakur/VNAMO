@@ -117,7 +117,8 @@
       </collision>
       <inertial>
         <origin xyz="2.073e-05   1.45286e-03  -1.1049e-03" rpy="0 0 0" />
-        <mass value="0.168" />
+        <!-- <mass value="0.168" /> -->
+        <mass value="0.35" />
         <inertia ixx="6.69695624e-05" ixy="5.21511788e-09" ixz="-2.74383009e-08" iyy="7.85088161e-05" iyz="5.41105193e-07" izz="1.41819717e-04" />
       </inertial>
     </link>
@@ -142,26 +143,45 @@
       </collision>
       <inertial>
         <origin xyz="2.073e-05   1.45286e-03  -1.1049e-03" rpy="0 0 0" />
-        <mass value="0.168" />
+        <!-- <mass value="0.168" /> -->
+        <mass value="0.35" />
         <inertia ixx="6.69695624e-05" ixy="5.21511788e-09" ixz="-2.74383009e-08" iyy="7.85088161e-05" iyz="5.41105193e-07" izz="1.41819717e-04" />
       </inertial>
     </link>
   
     <gazebo reference="${prefix}soft_robotics_gripper_base_link">
-        <material>Gazebo/Grey</material>
+      <material>Gazebo/Grey</material>
     </gazebo>
+
     <gazebo reference="${prefix}soft_robotics_left_finger_link1">
-        <material>Gazebo/Blue</material>
+      <material>Gazebo/Blue</material>
+      <mu1>1.5</mu1>
+      <mu2>1.5</mu2>
     </gazebo>
+
     <gazebo reference="${prefix}soft_robotics_right_finger_link1">
-        <material>Gazebo/Blue</material>
+      <material>Gazebo/Blue</material>
+      <mu1>1.5</mu1>
+      <mu2>1.5</mu2>
     </gazebo>
-      <gazebo reference="${prefix}soft_robotics_left_finger_link2">
-        <material>Gazebo/Blue</material>
+
+    <!-- TIP links -->
+    <gazebo reference="${prefix}soft_robotics_left_finger_link2">
+      <material>Gazebo/Blue</material>
+      <mu1>2.0</mu1>
+      <mu2>2.0</mu2>
+      <kp>150000.0</kp>
+      <kd>60.0</kd>
     </gazebo>
+
     <gazebo reference="${prefix}soft_robotics_right_finger_link2">
-        <material>Gazebo/Blue</material>
+      <material>Gazebo/Blue</material>
+      <mu1>2.0</mu1>
+      <mu2>2.0</mu2>
+      <kp>150000.0</kp>
+      <kd>60.0</kd>
     </gazebo>
+
 
     <ros2_control name="gripper" type="system">
         <hardware>

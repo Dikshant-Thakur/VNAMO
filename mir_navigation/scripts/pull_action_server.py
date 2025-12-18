@@ -2,563 +2,860 @@
 # -*- coding: utf-8 -*-
 
 import math
-from typing import Optional
+import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.duration import Duration
 
-from geometry_msgs.msg import PoseStamped, Pose, Vector3
+from geometry_msgs.msg import PoseStamped, Pose, Quaternion, Point, Twist
+from visualization_msgs.msg import Marker
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from control_msgs.action import FollowJointTrajectory
-
-from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import (
-    MotionPlanRequest,
-    PlanningOptions,
-    Constraints,
-    PositionConstraint,
-    OrientationConstraint,
-    BoundingVolume,
-)
 from shape_msgs.msg import SolidPrimitive
+
+from moveit_msgs.msg import CollisionObject, Constraints, OrientationConstraint, PositionConstraint, MoveItErrorCodes
 from moveit_msgs.srv import GetCartesianPath
+from moveit_msgs.action import MoveGroup
+
+from control_msgs.action import FollowJointTrajectory
+from nav2_msgs.action import NavigateToPose
+
+from sensor_msgs.msg import JointState
+
+# link attacher imports
+from linkattacher_msgs.srv import AttachLink, DetachLink
 
 import tf2_ros
-from tf2_ros import TransformException
-from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
-from rclpy.duration import Duration
-from rclpy.time import Time
+from scipy.spatial.transform import Rotation as R
+
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+
+from moveit_msgs.msg import PlanningScene
+from moveit_msgs.srv import ApplyPlanningScene
 
 
 class SimpleRodGrab(Node):
     """
-    Pipeline:
-      1) Map-frame pre-grasp pose -> transform to planning_frame
-      2) Move to pre-grasp
-      3) Open gripper
-      4) Move +Y in planning_frame
-      5) Close gripper
+    Focus: PRE-GRASP -> GRASP (linear cartesian) -> CLOSE GRIPPER -> ATTACH -> PULL BACK -> DETACH -> HOME
     """
 
     def __init__(self):
         super().__init__("simple_rod_grab")
 
-        # Use simulation time by default (can be overridden via ROS params)
-        # self.declare_parameter("use_sim_time", True)
+        qos = QoSProfile(depth=10)
+        qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        qos.reliability = ReliabilityPolicy.RELIABLE
 
-        # --- Parameters ---
-        self.moveit_group_name = (
-            self.declare_parameter("moveit_group_name", "ur5_manip")
-            .get_parameter_value()
-            .string_value
-        )
-        self.planning_frame = (
-            self.declare_parameter("planning_frame", "ur_base_link")
-            .get_parameter_value()
-            .string_value
-        )
-        self.ee_link = (
-            self.declare_parameter("ee_link", "ur_tool0")
-            .get_parameter_value()
-            .string_value
+        # Inflation params (for safer pre-grasp planning)
+        self.inflate_xy = 0.10
+        self.inflate_z  = 0.05
+
+        # Absolute topics (no namespace surprises)
+        self.scene_pub = self.create_publisher(PlanningScene, "/planning_scene", qos)
+        self.collision_pub = self.create_publisher(CollisionObject, "/collision_object", qos)
+        self.apply_scene = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
+
+        # --- Gazebo LinkAttacher ---
+        self.attach_cli = self.create_client(AttachLink, "/ATTACHLINK")
+        self.detach_cli = self.create_client(DetachLink, "/DETACHLINK")
+
+        self.attach_model_1 = "mir_robot"
+        self.attach_link_1  = "gripper_soft_robotics_left_finger_link1"
+        self.attach_model_2 = "Table"
+        self.attach_link_2  = "link"
+
+        self.grip_allowance = 0.05
+
+        # Frames / MoveIt
+        self.moveit_group = "ur5_manip"
+        self.planning_frame = "ur_base_link"
+        self.ee_link = "ur_tool0"
+
+        # Table in MAP
+        self.table_x = 0.0
+        self.table_y = 0.0
+        self.table_size_x = 0.65
+        self.table_size_y = 0.65
+        self.table_top_thickness = 0.012
+        self.table_center_z = 1.0
+
+        # Nav/footprint
+        self.base_length = 0.73
+        self.base_margin = 0.05
+        self.front_clearance = 0.5
+
+        # Grasp geometry
+        self.pre_dist = 0.25
+        self.inside_grasp = -0.015
+
+        self._last_js = None
+        self._js_sub = self.create_subscription(JointState, "/joint_states", self._on_joint_states, 10)
+
+        self.arm_joint_names = [
+            "ur_shoulder_pan_joint",
+            "ur_shoulder_lift_joint",
+            "ur_elbow_joint",
+            "ur_wrist_1_joint",
+            "ur_wrist_2_joint",
+            "ur_wrist_3_joint",
+        ]
+
+        # Gripper
+        self.gripper_open_cmd = 0.40
+        self.gripper_close_cmd = -0.20
+
+        # Cartesian sampling
+        self.cart_max_step = 0.005
+        self.tf_max_age_s = 0.30
+
+        # ROS I/O
+        self.marker_pub = self.create_publisher(Marker, "debug_markers", qos)
+
+        self.nav2_ac = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        self.movegroup_ac = ActionClient(self, MoveGroup, "move_action")
+        self.gripper_ac = ActionClient(self, FollowJointTrajectory, "gripper_controller/follow_joint_trajectory")
+        self.arm_traj_ac = ActionClient(self, FollowJointTrajectory, "joint_trajectory_controller/follow_joint_trajectory")
+        self.cartesian_client = self.create_client(GetCartesianPath, "compute_cartesian_path")
+
+        # Direct base velocity control (for straight back pull)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.get_logger().info("[INIT] SimpleRodGrab READY (PRE->GRASP->CLOSE->ATTACH->PULL->DETACH->HOME)")
+
+    # ---------------- Small utils ----------------
+    def _now(self):
+        return self.get_clock().now().to_msg()
+
+    def _quat_yaw(self, q: Quaternion) -> float:
+        return R.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
+
+    def _wait_tf(self, target, source, timeout_s=3.0) -> bool:
+        return self.tf_buffer.can_transform(
+            target, source, rclpy.time.Time(),
+            timeout=Duration(seconds=float(timeout_s))
         )
 
-        # Pre-grasp pose GIVEN IN /map FRAME (tumhare numbers yahan)
-        self.pre_map_x = (
-            self.declare_parameter("pre_map_x", 0.614 )
-            .get_parameter_value()
-            .double_value
-        )
-        self.pre_map_y = (
-            self.declare_parameter("pre_map_y",  -0.091 )
-            .get_parameter_value()
-            .double_value
-        )
-        self.pre_map_z = (
-            self.declare_parameter("pre_map_z", 1.437 )
-            .get_parameter_value()
-            .double_value
-        )
-
-        # Approach offset in planning_frame (+Y direction)
-        self.approach_delta_y = (
-            self.declare_parameter("approach_delta_y", 0.05)
-            .get_parameter_value()
-            .double_value
-        )
-
-                # Gripper config (controller = gripper_controller)
-        self.gripper_action_name = (
-            self.declare_parameter(
-                "gripper_action_name", "gripper_controller/follow_joint_trajectory"
+    def log_tf_age_and_pose(self, target="map", source="base_link"):
+        try:
+            tf = self.tf_buffer.lookup_transform(target, source, rclpy.time.Time())
+            now = self.get_clock().now()
+            tf_time = rclpy.time.Time.from_msg(tf.header.stamp)
+            age = (now - tf_time).nanoseconds / 1e9
+            yaw = self._quat_yaw(tf.transform.rotation)
+            self.get_logger().info(
+                f"[TF] {target}->{source} age={age:.3f}s "
+                f"pos=({tf.transform.translation.x:.3f},{tf.transform.translation.y:.3f}) yaw={yaw:.3f}"
             )
-            .get_parameter_value()
-            .string_value
+            if age > self.tf_max_age_s:
+                self.get_logger().warn(f"[TF] Transform is stale (age>{self.tf_max_age_s:.2f}s).")
+            return tf, age
+        except Exception as e:
+            self.get_logger().error(f"[TF] Missing {target}->{source}: {e}")
+            return None, None
+
+    # ---------------- Markers ----------------
+    def publish_marker(self, x, y, z, mid, r, g, b, scale=0.05):
+        m = Marker()
+        m.header.frame_id = "map"
+        m.header.stamp = self._now()
+        m.ns = "table_debug"
+        m.id = int(mid)
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.lifetime.sec = 0
+        m.lifetime.nanosec = 0
+        m.pose.position.x = float(x)
+        m.pose.position.y = float(y)
+        m.pose.position.z = float(z)
+        m.pose.orientation.w = 1.0
+        m.scale.x = float(scale)
+        m.scale.y = float(scale)
+        m.scale.z = float(scale)
+        m.color.a = 1.0
+        m.color.r = float(r)
+        m.color.g = float(g)
+        m.color.b = float(b)
+        self.marker_pub.publish(m)
+
+    # ---------------- Orientation (face table) ----------------
+    def get_orientation_facing_table(self, robot_x, robot_y):
+        dx = self.table_x - robot_x
+        dy = self.table_y - robot_y
+        yaw = math.atan2(dy, dx)
+        r_yaw = R.from_euler("z", yaw, degrees=False)
+        r_pitch = R.from_euler("y", 90, degrees=True)  # keep gripper horizontal
+        qx, qy, qz, qw = (r_yaw * r_pitch).as_quat()
+        return Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw))
+
+    # ---------------- Collision object publish ----------------
+    def update_obstacle(self, inflate: bool = False):
+        slab = CollisionObject()
+        slab.header.frame_id = "map"
+        slab.id = "table_slab"
+        slab.operation = CollisionObject.ADD
+
+        slab_box = SolidPrimitive()
+        slab_box.type = SolidPrimitive.BOX
+
+        if inflate:
+            sx = self.table_size_x + self.inflate_xy
+            sy = self.table_size_y + self.inflate_xy
+            sz = self.inflate_z
+            center_z = self.table_center_z + (sz - 0.008) / 2.0
+        else:
+            sx = self.table_size_x
+            sy = self.table_size_y
+            sz = 0.008
+            center_z = self.table_center_z
+
+        slab_box.dimensions = [sx, sy, sz]
+
+        slab_pose = Pose()
+        slab_pose.position.x = self.table_x
+        slab_pose.position.y = self.table_y
+        slab_pose.position.z = center_z
+        slab_pose.orientation.w = 1.0
+
+        slab.primitives = [slab_box]
+        slab.primitive_poses = [slab_pose]
+
+        tag = "INFLATED" if inflate else "REAL"
+        self.get_logger().info(
+            f"[SCENE] apply table_slab ({tag}) center=({self.table_x:.3f},{self.table_y:.3f},{center_z:.3f}) "
+            f"dims=({sx:.3f},{sy:.3f},{sz:.3f})"
         )
 
-        # FollowJointTrajectory gripper_controller controls BOTH finger joints
-        self.gripper_joint_names = [
+        ps = PlanningScene()
+        ps.is_diff = True
+        ps.world.collision_objects.append(slab)
+
+        for _ in range(10):
+            self.scene_pub.publish(ps)
+            time.sleep(0.05)
+
+        if not self.apply_scene.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn("[SCENE] /apply_planning_scene not available (move_group running?)")
+        else:
+            req = ApplyPlanningScene.Request()
+            req.scene = ps
+            fut = self.apply_scene.call_async(req)
+            rclpy.spin_until_future_complete(self, fut)
+            ok = bool(fut.result().success) if fut.result() else False
+            self.get_logger().info(f"[SCENE] apply_planning_scene success={ok}")
+
+    def get_current_ee_orientation_in_map(self) -> Quaternion:
+        rclpy.spin_once(self, timeout_sec=0.05)
+        if not self._wait_tf("map", self.ee_link, timeout_s=2.0):
+            raise RuntimeError(f"TF not ready: map -> {self.ee_link}")
+        tf = self.tf_buffer.lookup_transform("map", self.ee_link, rclpy.time.Time())
+        return tf.transform.rotation
+
+    # ---------------- Transform map->planning pose ----------------
+    def pose_map_to_planning(self, pose_map: PoseStamped) -> PoseStamped:
+        tf_pm = self.tf_buffer.lookup_transform(self.planning_frame, "map", rclpy.time.Time())
+        t = tf_pm.transform.translation
+        q = tf_pm.transform.rotation
+        rot = R.from_quat([q.x, q.y, q.z, q.w])
+
+        px, py, pz = pose_map.pose.position.x, pose_map.pose.position.y, pose_map.pose.position.z
+        rx, ry, rz = rot.apply([px, py, pz])
+
+        q_map = R.from_quat([
+            pose_map.pose.orientation.x,
+            pose_map.pose.orientation.y,
+            pose_map.pose.orientation.z,
+            pose_map.pose.orientation.w
+        ])
+        q_plan = (R.from_quat([q.x, q.y, q.z, q.w]) * q_map).as_quat()
+
+        out = PoseStamped()
+        out.header.frame_id = self.planning_frame
+        out.header.stamp = self._now()
+        out.pose.position.x = float(rx + t.x)
+        out.pose.position.y = float(ry + t.y)
+        out.pose.position.z = float(rz + t.z)
+        out.pose.orientation = Quaternion(
+            x=float(q_plan[0]), y=float(q_plan[1]), z=float(q_plan[2]), w=float(q_plan[3])
+        )
+        return out
+
+    # ---------------- Nav2 ----------------
+    def navigate_to_face(self, face, clearance):
+        hx, hy = self.table_size_x / 2.0, self.table_size_y / 2.0
+
+        if face == "+X":
+            fx, fy, nx, ny = self.table_x + hx, self.table_y, 1.0, 0.0
+        elif face == "-X":
+            fx, fy, nx, ny = self.table_x - hx, self.table_y, -1.0, 0.0
+        elif face == "+Y":
+            fx, fy, nx, ny = self.table_x, self.table_y + hy, 0.0, 1.0
+        else:
+            fx, fy, nx, ny = self.table_x, self.table_y - hy, 0.0, -1.0
+
+        dist = (self.base_length / 2.0) + self.base_margin + clearance
+        tx, ty = fx + nx * dist, fy + ny * dist
+        yaw = math.atan2(-ny, -nx)
+
+        self.get_logger().info(f"[NAV] face={face} clearance={clearance:.2f} goal=({tx:.3f},{ty:.3f}) yaw={yaw:.3f}")
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = "map"
+        goal.pose.header.stamp = self._now()
+        goal.pose.pose.position = Point(x=float(tx), y=float(ty), z=0.0)
+        goal.pose.pose.orientation = Quaternion(
+            z=float(math.sin(yaw / 2.0)), w=float(math.cos(yaw / 2.0))
+        )
+
+        self.nav2_ac.wait_for_server()
+        send_fut = self.nav2_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut)
+        gh = send_fut.result()
+        if not gh.accepted:
+            self.get_logger().error("[NAV] goal rejected")
+            return False
+
+        res_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_fut)
+        status = res_fut.result().status
+        ok = (status == 4)  # SUCCEEDED
+        self.get_logger().info(f"[NAV] done status={status} ok={ok}")
+        return ok
+
+    # ---------------- MoveIt pose plan+execute ----------------
+    def move_to_pose(self, pose_planning: PoseStamped):
+        goal = MoveGroup.Goal()
+        goal.request.group_name = self.moveit_group
+        goal.request.num_planning_attempts = 10
+        goal.request.allowed_planning_time = 5.0
+
+        oc = OrientationConstraint()
+        oc.header = pose_planning.header
+        oc.link_name = self.ee_link
+        oc.orientation = pose_planning.pose.orientation
+        oc.absolute_x_axis_tolerance = 0.10
+        oc.absolute_y_axis_tolerance = 0.10
+        oc.absolute_z_axis_tolerance = 3.14
+        oc.weight = 1.0
+
+        constraints = Constraints()
+        constraints.orientation_constraints = [oc]
+
+        pc = PositionConstraint()
+        pc.header = pose_planning.header
+        pc.link_name = self.ee_link
+        box = SolidPrimitive(type=SolidPrimitive.BOX, dimensions=[0.01, 0.01, 0.01])
+        region_pose = Pose(position=pose_planning.pose.position, orientation=Quaternion(w=1.0))
+        pc.constraint_region.primitives = [box]
+        pc.constraint_region.primitive_poses = [region_pose]
+        pc.weight = 1.0
+        constraints.position_constraints = [pc]
+
+        goal.request.goal_constraints = [constraints]
+        goal.planning_options.plan_only = False
+
+        self.movegroup_ac.wait_for_server()
+        fut = self.movegroup_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, fut)
+        gh = fut.result()
+        if not gh.accepted:
+            self.get_logger().error("[MOVEIT] goal rejected")
+            return False
+
+        res_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_fut)
+        code = res_fut.result().result.error_code.val
+        ok = (code == MoveItErrorCodes.SUCCESS)
+        self.get_logger().info(f"[MOVEIT] result error_code={code} ok={ok}")
+        return ok
+
+    # ---------------- Cartesian pre->grasp ----------------
+    def execute_cartesian_to(self, target_planning: PoseStamped):
+        if not self._wait_tf(self.planning_frame, self.ee_link):
+            self.get_logger().error("[CART] TF not ready for EE")
+            return False
+
+        cur_tf = self.tf_buffer.lookup_transform(self.planning_frame, self.ee_link, rclpy.time.Time())
+        start = Pose()
+        start.position.x = cur_tf.transform.translation.x
+        start.position.y = cur_tf.transform.translation.y
+        start.position.z = cur_tf.transform.translation.z
+        start.orientation = cur_tf.transform.rotation
+
+        req = GetCartesianPath.Request()
+        req.header.frame_id = self.planning_frame
+        req.group_name = self.moveit_group
+        req.link_name = self.ee_link
+        req.waypoints = [start, target_planning.pose]
+        req.max_step = float(self.cart_max_step)
+        req.jump_threshold = 0.0
+        req.avoid_collisions = True
+
+        self.get_logger().info(
+            f"[CART] start=({start.position.x:.3f},{start.position.y:.3f},{start.position.z:.3f}) "
+            f"target=({target_planning.pose.position.x:.3f},{target_planning.pose.position.y:.3f},{target_planning.pose.position.z:.3f}) "
+            f"max_step={req.max_step:.3f}"
+        )
+
+        self.cartesian_client.wait_for_service()
+        fut = self.cartesian_client.call_async(req)
+        rclpy.spin_until_future_complete(self, fut)
+        res = fut.result()
+
+        if not res.solution.joint_trajectory.points:
+            self.get_logger().error("[CART] failed: no trajectory points (likely collision/IK)")
+            return False
+
+        if res.fraction < 0.70:
+            self.get_logger().error(f"[CART] incomplete fraction={res.fraction:.3f} -> abort (likely collision)")
+            return False
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = res.solution.joint_trajectory
+        self.arm_traj_ac.wait_for_server()
+        send_fut = self.arm_traj_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut)
+        gh = send_fut.result()
+        if not gh.accepted:
+            self.get_logger().error("[ARM] trajectory rejected")
+            return False
+
+        res_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_fut)
+        self.get_logger().info("[ARM] cartesian execute done")
+        return True
+
+    # ---------------- Joint state helpers ----------------
+    def _on_joint_states(self, msg: JointState):
+        self._last_js = msg
+
+    def _get_arm_joint_positions(self):
+        if self._last_js is None:
+            return None
+        name_to_pos = {n: p for n, p in zip(self._last_js.name, self._last_js.position)}
+        try:
+            return [float(name_to_pos[n]) for n in self.arm_joint_names]
+        except KeyError:
+            return None
+
+    def rotate_wrist3_abs(self, deg: float, duration_s: float = 1.5) -> bool:
+        t0 = time.time()
+        while self._last_js is None and time.time() - t0 < 2.0:
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        cur = self._get_arm_joint_positions()
+        if cur is None:
+            self.get_logger().error("[WRIST3] No joint_states for UR joints. Check arm_joint_names.")
+            return False
+
+        cur[5] = math.radians(float(deg))
+
+        traj = JointTrajectory()
+        traj.joint_names = self.arm_joint_names
+
+        pt = JointTrajectoryPoint()
+        pt.positions = cur
+        pt.time_from_start.sec = int(duration_s)
+        pt.time_from_start.nanosec = int((duration_s - int(duration_s)) * 1e9)
+        traj.points = [pt]
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = traj
+
+        self.get_logger().info(f"[WRIST3] Move ur_wrist_3_joint -> {deg:+.1f} deg")
+        self.arm_traj_ac.wait_for_server()
+        send_fut = self.arm_traj_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut)
+        gh = send_fut.result()
+        if not gh.accepted:
+            self.get_logger().error("[WRIST3] Trajectory rejected")
+            return False
+
+        res_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_fut)
+        return True
+
+    # ---------------- Gripper ----------------
+    def operate_gripper(self, cmd_value: float, label: str):
+        label_u = label.upper()
+        if label_u == "OPEN":
+            return self.operate_gripper_one_shot(float(cmd_value), label="OPEN", duration_s=0.8)
+        if label_u == "CLOSE":
+            target = float(cmd_value) + float(self.grip_allowance)
+            self.get_logger().info(
+                f"[GRIP] CLOSE_FAST target={target:.3f} (cmd={cmd_value:.3f} allowance={self.grip_allowance:.3f})"
+            )
+            return self.operate_gripper_one_shot(target, label="CLOSE_FAST", duration_s=0.6)
+
+        return self.operate_gripper_one_shot(float(cmd_value), label=label_u, duration_s=0.8)
+
+    def operate_gripper_one_shot(self, cmd_value: float, label: str, duration_s: float = 1.0):
+        traj = JointTrajectory()
+        traj.joint_names = [
             "gripper_soft_robotics_gripper_left_finger_joint1",
             "gripper_soft_robotics_gripper_right_finger_joint1",
         ]
 
-        self.gripper_open = (
-            self.declare_parameter("gripper_open", 0.25)
-            .get_parameter_value()
-            .double_value
-        )
-        self.gripper_close = (
-            self.declare_parameter("gripper_close", -0.25)
-            .get_parameter_value()
-            .double_value
-        )
-
-
-        # --- TF ---
-        # Keep a short history in the TF buffer to make lookups more robust
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
-        # --- Action clients ---
-        self.move_action_name = (
-            self.declare_parameter("move_action_name", "move_action")
-            .get_parameter_value()
-            .string_value
-        )
-        self.movegroup_ac = ActionClient(self, MoveGroup, self.move_action_name)
-        self.gripper_ac = ActionClient(
-            self, FollowJointTrajectory, self.gripper_action_name
-        )
-                # Cartesian path service (for linear EE motion)
-        # NOTE: topic name may be remapped in your bringup; adjust if needed.
-        self.cartesian_client = self.create_client(
-            GetCartesianPath, "compute_cartesian_path"
-        )
-
-        # Direct FollowJointTrajectory client for the arm
-        self.arm_traj_ac = ActionClient(
-            self,
-            FollowJointTrajectory,
-            "joint_trajectory_controller/follow_joint_trajectory",
-        )
-
-        self.get_logger().info(
-            f"[INIT] group={self.moveit_group_name}, planning_frame={self.planning_frame}, ee_link={self.ee_link}"
-        )
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _make_pose(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        qx: float = 0.0,
-        qy: float = 0.0,
-        qz: float = 0.0,
-        qw: float = 1.0,
-        frame_id: Optional[str] = None,
-    ) -> PoseStamped:
-        ps = PoseStamped()
-        ps.header.frame_id = frame_id or self.planning_frame
-        # ps.header.stamp = self.get_clock().now().to_msg()
-        ps.header.stamp = Time().to_msg()  # ya 0 time bhi rakh sakte ho
-        ps.pose.position.x = float(x)
-        ps.pose.position.y = float(y)
-        ps.pose.position.z = float(z)
-        ps.pose.orientation.x = float(qx)
-        ps.pose.orientation.y = float(qy)
-        ps.pose.orientation.z = float(qz)
-        ps.pose.orientation.w = float(qw)
-        return ps
-
-    def _transform_pose(
-        self, pose_stamped: PoseStamped, target_frame: str, timeout_sec: float = 1.0
-    ) -> Optional[PoseStamped]:
-        """Transform pose_stamped to target_frame using TF."""
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                target_frame,
-                pose_stamped.header.frame_id,
-                Time(),  # rclpy.time.Time object
-                timeout=Duration(seconds=timeout_sec),  # rclpy.duration.Duration
-            )
-
-        except TransformException as ex:
-            self.get_logger().error(
-                f"[TF] Failed to transform {pose_stamped.header.frame_id} -> {target_frame}: {ex}"
-            )
-            return None
-
-        # ❗ Option A: do_transform_pose simple Pose pe chalega, PoseStamped pe nahi
-        pose_out = do_transform_pose(pose_stamped.pose, tf)
-
-        out = PoseStamped()
-        out.header = pose_stamped.header
-        out.header.frame_id = target_frame
-        out.header.stamp = self.get_clock().now().to_msg()
-        out.pose = pose_out
-        return out
-
-    
-    def _wait_for_tf(
-        self,
-        target_frame: str,
-        source_frame: str,
-        max_wait_sec: float = 10.0,
-        check_interval_sec: float = 0.2,
-    ) -> bool:
-        """Actively wait until a TF transform between source_frame and target_frame is available."""
-        start_time = self.get_clock().now()
-        while (self.get_clock().now() - start_time) < Duration(seconds=max_wait_sec):
-            try:
-                # We only care that the transform exists; we discard the value here.
-                self.tf_buffer.lookup_transform(
-                    target_frame,
-                    source_frame,
-                    Time(),
-                    timeout=Duration(seconds=0.5),
-                )
-                self.get_logger().info(
-                    f"[TF] Transform available: {source_frame} -> {target_frame}"
-                )
-                return True
-            except TransformException as ex:
-                self.get_logger().warn(
-                    f"[TF] Waiting for transform {source_frame} -> {target_frame}: {ex}"
-                )
-                rclpy.spin_once(self, timeout_sec=check_interval_sec)
-
-        self.get_logger().error(
-            f"[TF] Transform {source_frame} -> {target_frame} not available after {max_wait_sec:.1f}s"
-        )
-        return False
-
-    def _build_pose_goal(
-        self, pose_stamped: PoseStamped, relaxed: bool = False
-    ) -> MoveGroup.Goal:
-        if relaxed:
-            ori_tol_deg = 15.0
-            pos_radius_m = 0.08
-            plan_time = 3.0
-        else:
-            ori_tol_deg = 5.0
-            pos_radius_m = 0.02
-            plan_time = 2.0
-
-        # Orientation constraint
-        oc = OrientationConstraint()
-        oc.header = pose_stamped.header
-        oc.link_name = self.ee_link
-        oc.orientation = pose_stamped.pose.orientation
-        tol_rad = math.radians(ori_tol_deg)
-        oc.absolute_x_axis_tolerance = tol_rad
-        oc.absolute_y_axis_tolerance = tol_rad
-        oc.absolute_z_axis_tolerance = tol_rad
-        oc.weight = 1.0
-
-        # Position constraint = small sphere around desired EE position
-        sphere = SolidPrimitive()
-        sphere.type = SolidPrimitive.SPHERE
-        sphere.dimensions = [pos_radius_m]
-
-        center = Pose()
-        center.position = pose_stamped.pose.position
-        center.orientation.w = 1.0
-
-        bv = BoundingVolume()
-        bv.primitives = [sphere]
-        bv.primitive_poses = [center]
-
-        pc = PositionConstraint()
-        pc.header = pose_stamped.header
-        pc.link_name = self.ee_link
-        pc.target_point_offset = Vector3(x=0.0, y=0.0, z=0.0)
-        pc.constraint_region = bv
-        pc.weight = 1.0
-
-        cons = Constraints()
-        cons.orientation_constraints = [oc]
-        cons.position_constraints = [pc]
-
-        req = MotionPlanRequest()
-        req.group_name = self.moveit_group_name
-        req.goal_constraints = [cons]
-        req.allowed_planning_time = plan_time
-        req.num_planning_attempts = 1
-
-        opts = PlanningOptions()
-        opts.plan_only = False
-        opts.look_around = False
-        opts.replan = False
-
-        goal = MoveGroup.Goal()
-        goal.request = req
-        goal.planning_options = opts
-        return goal
-
-    def _execute_moveit_pose(
-        self, pose_stamped: PoseStamped, relaxed: bool = False, timeout_sec: float = 20.0
-    ) -> bool:
-        if not self.movegroup_ac.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("[MOVE] MoveGroup action server not available")
-            return False
-
-        goal = self._build_pose_goal(pose_stamped, relaxed=relaxed)
-        self.get_logger().info(
-            f"[MOVE] Sending goal to ({pose_stamped.pose.position.x:.3f}, "
-            f"{pose_stamped.pose.position.y:.3f}, {pose_stamped.pose.position.z:.3f})"
-        )
-
-        send_future = self.movegroup_ac.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=timeout_sec)
-
-        goal_handle = send_future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error("[MOVE] Goal rejected")
-            return False
-
-        self.get_logger().info("[MOVE] Goal accepted, waiting for result...")
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout_sec)
-
-        res = result_future.result()
-        if res is None:
-            self.get_logger().error("[MOVE] Result future returned None")
-            return False
-
-        ok = getattr(res.result.error_code, "val", 0) == 1
-        self.get_logger().info(f"[MOVE] Done: {'OK' if ok else 'FAIL'}")
-        return bool(ok)
-
-
-    def _execute_linear_approach(
-        self,
-        start_pose: PoseStamped,
-        delta_y: float,
-        eef_step: float = 0.01,
-        jump_threshold: float = 0.0,
-        timeout_sec: float = 20.0,
-    ) -> bool:
-        """Move EE in a (approximately) straight line along +Y by delta_y."""
-
-        # 1) Wait for Cartesian path service
-        if not self.cartesian_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("[CART] compute_cartesian_path service not available")
-            return False
-
-        # 2) Build GetCartesianPath request
-        req = GetCartesianPath.Request()
-        req.group_name = self.moveit_group_name
-        req.link_name = self.ee_link
-        req.max_step = float(eef_step)        # max EE step (meters) between points
-        req.jump_threshold = float(jump_threshold)
-        req.avoid_collisions = True
-
-        req.header.frame_id = self.planning_frame
-        req.header.stamp = self.get_clock().now().to_msg()
-
-        # Start state = current robot state (leave default / empty -> MoveIt uses current)
-        # Waypoints: start_pose, then same pose with y += delta_y
-        start = Pose()
-        start.position = start_pose.pose.position
-        start.orientation = start_pose.pose.orientation
-
-        end = Pose()
-        end.position.x = start.position.x
-        end.position.y = start.position.y + float(delta_y)
-        end.position.z = start.position.z
-        end.orientation = start.orientation
-
-        req.waypoints = [start, end]
-
-        self.get_logger().info(
-            f"[CART] Requesting linear approach of {delta_y:.3f} m along +Y "
-            f"in frame {self.planning_frame}"
-        )
-
-        # 3) Call service
-        future = self.cartesian_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
-
-        res = future.result()
-        if res is None:
-            self.get_logger().error("[CART] No response from compute_cartesian_path")
-            return False
-
-        if not res.solution.joint_trajectory.points:
-            self.get_logger().error(
-                f"[CART] Empty trajectory, fraction={res.fraction:.3f}"
-            )
-            return False
-
-        if res.fraction < 0.99:
-            self.get_logger().warn(
-                f"[CART] Cartesian path incomplete: fraction={res.fraction:.3f}"
-            )
-            # Decide: you can return False here if you want strict behavior
-            # return False
-
-        traj = res.solution.joint_trajectory
-
-        # 4) Execute the joint trajectory on the arm controller
-        if not self.arm_traj_ac.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error(
-                "[CART] Arm FollowJointTrajectory action server not available"
-            )
-            return False
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(cmd_value), float(cmd_value)]
+        pt.time_from_start.sec = int(duration_s)
+        pt.time_from_start.nanosec = int((duration_s - int(duration_s)) * 1e9)
+        traj.points = [pt]
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = traj
 
-        self.get_logger().info(
-            f"[CART] Executing Cartesian trajectory with "
-            f"{len(traj.points)} points on joints={traj.joint_names}"
-        )
-
-        send_future = self.arm_traj_ac.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=timeout_sec)
-
-        goal_handle = send_future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error("[CART] Cartesian goal rejected by controller")
-            return False
-
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout_sec)
-
-        result = result_future.result()
-        if result is None:
-            self.get_logger().error("[CART] No result from arm trajectory action")
-            return False
-
-        self.get_logger().info("[CART] Cartesian approach completed")
+        self.get_logger().info(f"[GRIP] {label} cmd={cmd_value:.3f}")
+        self.gripper_ac.wait_for_server()
+        send_fut = self.gripper_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut)
+        time.sleep(max(0.2, duration_s))
         return True
 
-
-    def _execute_gripper(self, position: float, duration: float = 1.0) -> bool:
-        """FollowJointTrajectory for BOTH gripper joints."""
-        if not self.gripper_ac.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("[GRIP] Gripper action server not available")
+    # ---------------- Attach/Detach ----------------
+    def attach_sheet_now(self) -> bool:
+        if not self.attach_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("[ATTACH] /ATTACHLINK service not available")
             return False
+
+        req = AttachLink.Request()
+        req.model1_name = self.attach_model_1
+        req.link1_name  = self.attach_link_1
+        req.model2_name = self.attach_model_2
+        req.link2_name  = self.attach_link_2
+
+        self.get_logger().info(
+            f"[ATTACH] Request: ({req.model1_name}::{req.link1_name}) <-> ({req.model2_name}::{req.link2_name})"
+        )
+
+        fut = self.attach_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut)
+        res = fut.result()
+        if res is None:
+            self.get_logger().error("[ATTACH] Service call failed (no response)")
+            return False
+
+        self.get_logger().info("[ATTACH] done ✅")
+        return True
+
+    def detach_sheet_now(self) -> bool:
+        if not self.detach_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("[DETACH] /DETACHLINK service not available")
+            return False
+
+        req = DetachLink.Request()
+        req.model1_name = self.attach_model_1
+        req.link1_name  = self.attach_link_1
+        req.model2_name = self.attach_model_2
+        req.link2_name  = self.attach_link_2
+
+        self.get_logger().info(
+            f"[DETACH] Request: ({req.model1_name}::{req.link1_name}) X ({req.model2_name}::{req.link2_name})"
+        )
+
+        fut = self.detach_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut)
+        res = fut.result()
+        if res is None:
+            self.get_logger().error("[DETACH] Service call failed (no response)")
+            return False
+
+        self.get_logger().info("[DETACH] done ✅")
+        return True
+
+    # ---------------- Base straight reverse ----------------
+    def stop_base(self):
+        tw = Twist()
+        tw.linear.x = 0.0
+        tw.angular.z = 0.0
+        self.cmd_vel_pub.publish(tw)
+
+    def pull_back_straight(self, distance_m: float = 2.0, speed_mps: float = 0.15, timeout_s: float = 30.0) -> bool:
+        """
+        Move straight backwards (no turning) using /cmd_vel.
+        Distance measured in map frame by projecting displacement onto initial backward direction.
+        """
+        # Ensure TF updates
+        rclpy.spin_once(self, timeout_sec=0.05)
+        if not self._wait_tf("map", "base_link", timeout_s=2.0):
+            self.get_logger().error("[PULL] TF not ready map->base_link")
+            return False
+
+        tf0 = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
+        x0 = tf0.transform.translation.x
+        y0 = tf0.transform.translation.y
+        yaw0 = self._quat_yaw(tf0.transform.rotation)
+
+        # Backward direction in map
+        bx = -math.cos(yaw0)
+        by = -math.sin(yaw0)
+
+        self.get_logger().info(
+            f"[PULL] Start ({x0:.3f},{y0:.3f}) yaw={yaw0:.3f} back_dir=({bx:.3f},{by:.3f}) "
+            f"target_dist={distance_m:.2f} speed={speed_mps:.2f}"
+        )
+
+        t_start = time.time()
+        rate_hz = 20.0
+        dt = 1.0 / rate_hz
+
+        tw = Twist()
+        tw.linear.x = -abs(speed_mps)
+        tw.angular.z = 0.0
+
+        last_log = 0.0
+        while True:
+            if time.time() - t_start > timeout_s:
+                self.get_logger().error("[PULL] Timeout reached, stopping base")
+                self.stop_base()
+                return False
+
+            # Drive
+            self.cmd_vel_pub.publish(tw)
+
+            # Update TF
+            rclpy.spin_once(self, timeout_sec=0.0)
+            try:
+                tf = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
+            except Exception:
+                time.sleep(dt)
+                continue
+
+            x = tf.transform.translation.x
+            y = tf.transform.translation.y
+            dx = x - x0
+            dy = y - y0
+
+            progress = dx * bx + dy * by  # projection onto backward direction
+
+            if time.time() - last_log > 0.5:
+                self.get_logger().info(f"[PULL] progress={progress:.3f}m / {distance_m:.3f}m pos=({x:.3f},{y:.3f})")
+                last_log = time.time()
+
+            if progress >= distance_m:
+                self.get_logger().info("[PULL] Target distance reached ✅ stopping")
+                self.stop_base()
+                time.sleep(0.3)
+                return True
+
+            time.sleep(dt)
+
+    # ---------------- Arm Home ----------------
+    def go_arm_home(self, duration_s: float = 3.0) -> bool:
+        """
+        Move manipulator to user-provided home joint configuration.
+        """
+        home = {
+            "ur_shoulder_pan_joint": -1.57,
+            "ur_shoulder_lift_joint": -1.57,
+            "ur_elbow_joint": -1.57,
+            "ur_wrist_1_joint": -0.3,
+            "ur_wrist_2_joint": 1.57,
+            "ur_wrist_3_joint": 0.0,
+        }
+
+        positions = [float(home[n]) for n in self.arm_joint_names]
 
         traj = JointTrajectory()
-        traj.joint_names = list(self.gripper_joint_names)
+        traj.joint_names = self.arm_joint_names
 
         pt = JointTrajectoryPoint()
-        # Same position on both fingers (symmetrical gripper)
-        pt.positions = [float(position)] * len(self.gripper_joint_names)
-        pt.time_from_start.sec = int(duration)
-        pt.time_from_start.nanosec = int((duration - int(duration)) * 1e9)
-        traj.points.append(pt)
+        pt.positions = positions
+        pt.time_from_start.sec = int(duration_s)
+        pt.time_from_start.nanosec = int((duration_s - int(duration_s)) * 1e9)
+        traj.points = [pt]
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = traj
 
+        self.get_logger().info("[HOME] Moving arm to HOME joint config...")
+        self.arm_traj_ac.wait_for_server()
+        send_fut = self.arm_traj_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut)
+        gh = send_fut.result()
+        if not gh.accepted:
+            self.get_logger().error("[HOME] Trajectory rejected")
+            return False
+
+        res_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_fut)
+        self.get_logger().info("[HOME] Arm at HOME ✅")
+        return True
+
+    # ---------------- Main sequence ----------------
+    def execute_sequence(self):
+        self.get_logger().info("[SEQ] Starting PRE -> GRASP -> CLOSE -> ATTACH -> PULL -> DETACH -> HOME")
+
+        # 1) Publish inflated table collision
+        self.update_obstacle(inflate=True)
+
+        # 2) Wait for TF
+        self.get_logger().info("[TF] Waiting for map -> base_link TF...")
+        t0 = time.time()
+        timeout = 25.0
+        last_log = 0.0
+
+        while time.time() - t0 < timeout:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.tf_buffer.can_transform("map", "base_link", rclpy.time.Time()):
+                self.get_logger().info("[TF] map->base_link available ✅")
+                break
+            if time.time() - last_log > 0.5:
+                self.get_logger().info("[TF] still waiting (map/base_link not ready yet)...")
+                last_log = time.time()
+
+        if not self.tf_buffer.can_transform("map", "base_link", rclpy.time.Time()):
+            self.get_logger().error("[TF] Timeout waiting for map->base_link. Abort.")
+            return
+
+        # 3) Base pose
+        tf_base, _ = self.log_tf_age_and_pose("map", "base_link")
+        if tf_base is None:
+            self.get_logger().error("[SEQ] Abort: TF lookup failed.")
+            return
+
+        bx = tf_base.transform.translation.x
+        by = tf_base.transform.translation.y
+
+        # 4) Face selection
+        dx = bx - self.table_x
+        dy = by - self.table_y
+        scores = {"+X": dx, "-X": -dx, "+Y": dy, "-Y": -dy}
+        chosen = max(scores, key=lambda k: scores[k])
+
         self.get_logger().info(
-            f"[GRIP] Sending gripper position={position:.3f} to joints={self.gripper_joint_names}"
-        )
-        send_future = self.gripper_ac.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
-
-        goal_handle = send_future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().error("[GRIP] Goal rejected")
-            return False
-
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=10.0)
-
-        res = result_future.result()
-        if res is None:
-            self.get_logger().error("[GRIP] No result from gripper action")
-            return False
-
-        self.get_logger().info("[GRIP] Gripper action finished")
-        return True
-
-    # ------------------------------------------------------------------
-    # Main sequence
-    # ------------------------------------------------------------------
-    def execute_sequence(self) -> bool:
-        self.get_logger().info("[SEQ] Starting rod grab sequence")
-
-        # 1) Pre-grasp pose in /map frame (tumhare numbers)
-        pre_pose_map = self._make_pose(
-            self.pre_map_x,
-            self.pre_map_y,
-            self.pre_map_z,
-            qx=0.0,
-            qy=0.0,
-            qz=0.0,
-            qw=1.0,
-            frame_id="map",
+            "[FACE] scores " + " ".join([f"{k}={v:+.3f}" for k, v in scores.items()]) + f" -> selected={chosen}"
         )
 
-        # Transform /map -> planning_frame (e.g. ur_base_link)
-        pre_pose_planning = self._transform_pose(
-            pre_pose_map, self.planning_frame, timeout_sec=1.0
+        # 5) NAV2 to face
+        if not self.navigate_to_face(chosen, self.front_clearance):
+            self.get_logger().error("[SEQ] Abort: NAV failed")
+            return
+
+        # 6) Edge pts
+        hx, hy = self.table_size_x / 2.0, self.table_size_y / 2.0
+        edge_pts = {
+            "+X": (self.table_x + hx, self.table_y, 1.0, 0.0),
+            "-X": (self.table_x - hx, self.table_y, -1.0, 0.0),
+            "+Y": (self.table_x, self.table_y + hy, 0.0, 1.0),
+            "-Y": (self.table_x, self.table_y - hy, 0.0, -1.0),
+        }
+        fx, fy, nx, ny = edge_pts[chosen]
+
+        z_target = float(self.table_center_z)
+        pre_x = fx + nx * self.pre_dist
+        pre_y = fy + ny * self.pre_dist
+        grasp_x = fx - nx * self.inside_grasp
+        grasp_y = fy - ny * self.inside_grasp
+
+        self.get_logger().info(
+            f"[PTS] z_target={z_target:.3f} face={chosen} "
+            f"face_center=({fx:.3f},{fy:.3f}) n=({nx:.1f},{ny:.1f}) "
+            f"pre=({pre_x:.3f},{pre_y:.3f},{z_target:.3f}) "
+            f"grasp=({grasp_x:.3f},{grasp_y:.3f},{z_target:.3f})"
         )
-        if pre_pose_planning is None:
-            self.get_logger().error("[SEQ] Failed to transform pre-grasp pose to planning_frame")
-            return False
 
-        # 1) Move to pre-grasp (planning_frame)
-        if not self._execute_moveit_pose(pre_pose_planning, relaxed=False):
-            self.get_logger().error("[SEQ] Failed to reach pre-grasp pose")
-            return False
+        # Markers
+        self.publish_marker(self.table_x, self.table_y, z_target + 0.030, mid=0, r=1.0, g=0.0, b=0.0, scale=0.06)
+        self.publish_marker(pre_x, pre_y, z_target + 0.015, mid=1, r=0.0, g=1.0, b=0.0, scale=0.05)
+        self.publish_marker(grasp_x, grasp_y, z_target + 0.015, mid=2, r=0.0, g=0.0, b=1.0, scale=0.05)
+        for _ in range(5):
+            rclpy.spin_once(self, timeout_sec=0.05)
 
-        # 2) Open gripper
-        if not self._execute_gripper(self.gripper_open):
-            self.get_logger().error("[SEQ] Failed to open gripper")
-            return False
+        # 9) Orientation
+        tf_base2, _ = self.log_tf_age_and_pose("map", "base_link")
+        if tf_base2 is None:
+            self.get_logger().error("[SEQ] Abort: TF lost after NAV")
+            return
 
-        # 3) Approach along +Y in planning_frame
-        approach_pose = PoseStamped()
-        approach_pose.header.frame_id = self.planning_frame
-        approach_pose.header.stamp = self.get_clock().now().to_msg()
-        approach_pose.pose = pre_pose_planning.pose
+        q_orient = self.get_orientation_facing_table(
+            tf_base2.transform.translation.x,
+            tf_base2.transform.translation.y
+        )
 
-        approach_pose.pose.position.y += self.approach_delta_y
+        # 10) OPEN gripper (explicit)
+        self.operate_gripper(self.gripper_open_cmd, "OPEN")
 
-        # 3) Linear approach along +Y in planning_frame (Cartesian path)
-        if not self._execute_linear_approach(pre_pose_planning, self.approach_delta_y):
-            self.get_logger().error("[SEQ] Failed to do linear approach motion")
-            return False
+        # 11) MoveIt PRE
+        pose_pre = PoseStamped()
+        pose_pre.header.frame_id = "map"
+        pose_pre.header.stamp = self._now()
+        pose_pre.pose.position = Point(x=float(pre_x), y=float(pre_y), z=float(z_target))
+        pose_pre.pose.orientation = q_orient
 
-        # 4) Close gripper
-        if not self._execute_gripper(self.gripper_close):
-            self.get_logger().error("[SEQ] Failed to close gripper")
-            return False
+        self.get_logger().info("[MOVE] MoveIt -> PRE")
+        if not self.move_to_pose(self.pose_map_to_planning(pose_pre)):
+            self.get_logger().error("[SEQ] Abort: failed to reach PRE")
+            return
 
-        self.get_logger().info("[SEQ] Rod grab sequence completed successfully ✅")
-        return True
+        # 11.5) Wrist rotate
+        if not self.rotate_wrist3_abs(90.0):
+            self.get_logger().error("[SEQ] Abort: failed to rotate wrist_3")
+            return
+
+        # Lock current EE orientation
+        try:
+            ee_q_map = self.get_current_ee_orientation_in_map()
+            self.get_logger().info(
+                f"[EE] post-wrist ori(map) q=({ee_q_map.x:.3f},{ee_q_map.y:.3f},{ee_q_map.z:.3f},{ee_q_map.w:.3f})"
+            )
+        except Exception as e:
+            self.get_logger().error(f"[EE] Failed to read current EE orientation in map: {e}")
+            return
+
+        # 12) Cartesian PRE -> GRASP
+        pose_grasp = PoseStamped()
+        pose_grasp.header.frame_id = "map"
+        pose_grasp.header.stamp = self._now()
+        pose_grasp.pose.position = Point(x=float(grasp_x), y=float(grasp_y), z=float(z_target))
+        pose_grasp.pose.orientation = ee_q_map
+
+        self.update_obstacle(inflate=False)
+
+        self.get_logger().info("[MOVE] Cartesian PRE -> GRASP (linear)")
+        if not self.execute_cartesian_to(self.pose_map_to_planning(pose_grasp)):
+            self.get_logger().error("[SEQ] Abort: failed to reach GRASP")
+            return
+
+        # 13) CLOSE + ATTACH
+        self.operate_gripper(self.gripper_close_cmd, "CLOSE")
+        if not self.attach_sheet_now():
+            self.get_logger().warn("[ATTACH] attach failed, but continuing")
+
+        # 14) PULL BACK straight ~2m (no turning)
+        self.get_logger().info("[SEQ] Pulling back straight ~2.0m ...")
+        ok_pull = self.pull_back_straight(distance_m=2.0, speed_mps=0.15, timeout_s=40.0)
+        if not ok_pull:
+            self.get_logger().warn("[SEQ] Pull-back failed/timeout, continuing to detach/home anyway")
+
+        # 15) DETACH
+        if not self.detach_sheet_now():
+            self.get_logger().warn("[DETACH] detach failed")
+
+        # (optional) open gripper after detach
+        self.operate_gripper(self.gripper_open_cmd, "OPEN")
+
+        # 16) ARM HOME
+        if not self.go_arm_home(duration_s=3.0):
+            self.get_logger().warn("[HOME] failed to reach home")
+
+        self.get_logger().info("[SEQ] DONE ✅ (Grip + Pull + Detach + Home)")
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = SimpleRodGrab()
 
-    # Wait until the transform map -> planning_frame is available.
-    node.get_logger().info(
-        f"[TF] Waiting for transform map -> {node.planning_frame} before starting sequence..."
-    )
-    if not node._wait_for_tf(node.planning_frame, "map", max_wait_sec=10.0):
-        node.get_logger().error("[MAIN] TF not ready, aborting sequence.")
-        node.destroy_node()
-        rclpy.shutdown()
-        return
+    node.execute_sequence()
 
-    try:
-        ok = node.execute_sequence()
-        if not ok:
-            node.get_logger().error("[MAIN] Sequence failed")
-        else:
-            node.get_logger().info("[MAIN] Sequence SUCCESS")
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    for _ in range(50):
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == "__main__":
