@@ -73,8 +73,8 @@ class SimpleRodGrab(Node):
         self.ee_link = "ur_tool0"
 
         # Table in MAP
-        self.table_x = 0.0
-        self.table_y = 0.0
+        self.table_x = 7.97
+        self.table_y = 0.28
         self.table_size_x = 0.65
         self.table_size_y = 0.65
         self.table_top_thickness = 0.012
