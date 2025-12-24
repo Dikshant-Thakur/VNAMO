@@ -141,6 +141,9 @@ class VisibilityActionServer(Node):
             "use_sim_time", rclpy.Parameter.Type.BOOL, True
         )])
         
+        
+        self._dummy_one_move_clear = False   # table/test_box dono ke liye
+
 
         # ---- Obstacle database (local) ----
         self.obstacles = {
@@ -157,6 +160,14 @@ class VisibilityActionServer(Node):
                 "width": 0.25,
             },
             # yahan future obstacles add kar sakte ho
+            
+            "table": {
+                "x": 7.97,
+                "y": 0.28,
+                "length": 0.65,   # <-- apni table ka actual length daal do
+                "width":  0.65,   # <-- apni table ka actual width daal do
+		},
+
         }
 
         # Work-state
@@ -982,6 +993,14 @@ class VisibilityActionServer(Node):
 
             if self._job_state == "WAIT_INIT_ORIENT":
                 if self._moveit_motion_done():
+                    # ✅ Dummy table mode: after first MoveIt orient, finish as CLEAR
+                    if getattr(self, "_dummy_one_move_clear", False):
+                        self.get_logger().info("[DUMMY_CLEAR] Init orient done -> finishing success as CLEAR (no obstacle).")
+                        self._obst_detected = False
+                        self._finish_success(coverage=1.0)
+                        return
+
+                    # Normal flow
                     self._job_state = "ITERATE"
                 return
 
@@ -1013,6 +1032,37 @@ class VisibilityActionServer(Node):
             self.get_logger().error(f"[JOB] Tick error: {e}\n{tb}")
             self._finish_failure()
 
+
+    def _name_of_obstacle_inside_roi(obstacles: dict, roi_cx, roi_cy, roi_L, roi_W, roi_yaw):
+        halfL = 0.5 * float(roi_L)
+        halfW = 0.5 * float(roi_W)
+
+        c = math.cos(-roi_yaw)
+        s = math.sin(-roi_yaw)
+
+        best_name = None
+        best_score = float("inf")  # choose nearest-to-ROI-center if multiple
+
+        for name, ob in obstacles.items():
+            ox = float(ob["x"])
+            oy = float(ob["y"])
+
+            # world -> ROI local (rotate around ROI center)
+            dx = ox - float(roi_cx)
+            dy = oy - float(roi_cy)
+            x_local = c * dx - s * dy
+            y_local = s * dx + c * dy
+
+            inside = (abs(x_local) <= halfL) and (abs(y_local) <= halfW)
+            if inside:
+                score = (x_local * x_local + y_local * y_local)  # small is better
+                if score < best_score:
+                    best_score = score
+                    best_name = name
+
+        return best_name
+
+
     # ---------- Action execute ----------
     def execute_visibility(self, goal_handle):
         goal = goal_handle.request
@@ -1023,6 +1073,8 @@ class VisibilityActionServer(Node):
         )
 
         obst_name = (goal.obstacle_name or "").strip()
+        self._dummy_one_move_clear = (obst_name in ("table", "test_box"))
+
         if not obst_name:
             self.get_logger().warn("[ACT] Empty obstacle_name in goal, aborting.")
             result = CheckVisibility.Result()
@@ -1084,6 +1136,33 @@ class VisibilityActionServer(Node):
             f"[ACT] ROI center=({cx:.2f},{cy:.2f}) L={L:.2f} W={W:.2f} yaw={math.degrees(yaw):.1f}°"
         )
 
+
+        resolved_name = None
+        halfL = 0.5 * float(L)
+        halfW = 0.5 * float(W)
+
+        c = math.cos(-yaw)
+        s = math.sin(-yaw)
+
+        for name, ob_i in self.obstacles.items():
+            ox = float(ob_i["x"])
+            oy = float(ob_i["y"])
+
+            dx = ox - float(cx)
+            dy = oy - float(cy)
+
+            # world -> ROI local
+            x_local = c * dx - s * dy
+            y_local = s * dx + c * dy
+
+            if abs(x_local) <= halfL and abs(y_local) <= halfW:
+                resolved_name = name
+                break
+
+        self.get_logger().info(
+            f"[ACT] ROI obstacle resolve -> {resolved_name}"
+        )
+
         self._reset_motion_handles()
         self._last_result_blocked = True
         self._job_done_evt.clear()
@@ -1129,6 +1208,7 @@ class VisibilityActionServer(Node):
 
         result = CheckVisibility.Result()
         result.obstacle_present = bool(self._last_result_blocked)
+        result.obstacle_name = resolved_name if result.obstacle_present else ""
         if self._last_result_blocked:
             self.get_logger().info("[ACT] Done: obstacle present")
         else:

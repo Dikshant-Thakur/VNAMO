@@ -23,6 +23,14 @@ from nav2_msgs.action import NavigateToPose
 
 from sensor_msgs.msg import JointState
 
+
+from rclpy.action import ActionServer, GoalResponse, CancelResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
+from mir_navigation.action import PullTrigger
+
+
 # link attacher imports
 from linkattacher_msgs.srv import AttachLink, DetachLink
 
@@ -46,6 +54,26 @@ class SimpleRodGrab(Node):
         qos = QoSProfile(depth=10)
         qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         qos.reliability = ReliabilityPolicy.RELIABLE
+
+        # ---- START POSE (before sequence) ----
+        self.start_x = 7.860
+        self.start_y = -1.690
+        self.start_enabled = True   # False kar doge to skip ho jayega
+
+
+
+        self._cb_group = ReentrantCallbackGroup()
+
+        self._pull_as = ActionServer(
+            self,
+            PullTrigger,
+            "pull_trigger",          # MUST match planner client name
+            execute_callback=self._on_pull_execute,
+            goal_callback=self._on_pull_goal,
+            cancel_callback=self._on_pull_cancel,
+            callback_group=self._cb_group,
+            )
+
 
         # Inflation params (for safer pre-grasp planning)
         self.inflate_xy = 0.10
@@ -119,12 +147,53 @@ class SimpleRodGrab(Node):
         self.cartesian_client = self.create_client(GetCartesianPath, "compute_cartesian_path")
 
         # Direct base velocity control (for straight back pull)
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/diff_cont/cmd_vel_unstamped", 10)
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.get_logger().info("[INIT] SimpleRodGrab READY (PRE->GRASP->CLOSE->ATTACH->PULL->DETACH->HOME)")
+    
+
+
+
+    # ---------------- Action Server Callbacks ----------------
+
+    def _on_pull_goal(self, goal_request):
+        if not getattr(goal_request, "trigger", False):
+            self.get_logger().warn("[PULL_AS] Rejected: trigger=False")
+            return GoalResponse.REJECT
+        self.get_logger().info("[PULL_AS] Goal accepted (trigger=True)")
+        return GoalResponse.ACCEPT
+
+    def _on_pull_cancel(self, goal_handle):
+        self.get_logger().warn("[PULL_AS] Cancel requested (not implemented fully, accepting cancel).")
+        return CancelResponse.ACCEPT
+
+    def _on_pull_execute(self, goal_handle):
+        result = PullTrigger.Result()
+        try:
+            ok = bool(getattr(goal_handle.request, "trigger", False))
+            if not ok:
+                goal_handle.abort()
+                result.success = False
+                return result
+
+            # Run your existing pipeline
+            self.execute_sequence()
+
+            # Agar tumhe "success" strict chahiye, execute_sequence ko bool return karwao.
+            goal_handle.succeed()
+            result.success = True
+            return result
+
+        except Exception as e:
+            self.get_logger().error(f"[PULL_AS] Exception: {e}")
+            goal_handle.abort()
+            result.success = False
+            return result
+
+
 
     # ---------------- Small utils ----------------
     def _now(self):
@@ -284,6 +353,42 @@ class SimpleRodGrab(Node):
         return out
 
     # ---------------- Nav2 ----------------
+
+    def navigate_to_xy(self, x: float, y: float, yaw: float = None):
+        """
+        Navigate robot base to (x,y) in map. If yaw is None, face the table from that point.
+        """
+        if yaw is None:
+            yaw = math.atan2(self.table_y - y, self.table_x - x)
+
+        self.get_logger().info(f"[NAV_START] goal=({x:.3f},{y:.3f}) yaw={yaw:.3f}")
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = "map"
+        goal.pose.header.stamp = self._now()
+        goal.pose.pose.position = Point(x=float(x), y=float(y), z=0.0)
+        goal.pose.pose.orientation = Quaternion(
+            z=float(math.sin(yaw / 2.0)), w=float(math.cos(yaw / 2.0))
+        )
+
+        self.nav2_ac.wait_for_server()
+        send_fut = self.nav2_ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send_fut)
+        gh = send_fut.result()
+        if not gh.accepted:
+            self.get_logger().error("[NAV_START] goal rejected")
+            return False
+
+        res_fut = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_fut)
+        status = res_fut.result().status
+        ok = (status == 4)  # SUCCEEDED
+        self.get_logger().info(f"[NAV_START] done status={status} ok={ok}")
+        return ok
+
+
+
+
     def navigate_to_face(self, face, clearance):
         hx, hy = self.table_size_x / 2.0, self.table_size_y / 2.0
 
@@ -689,6 +794,12 @@ class SimpleRodGrab(Node):
     def execute_sequence(self):
         self.get_logger().info("[SEQ] Starting PRE -> GRASP -> CLOSE -> ATTACH -> PULL -> DETACH -> HOME")
 
+        # 0) Go to requested start pose first
+        if getattr(self, "start_enabled", False):
+            if not self.navigate_to_xy(self.start_x, self.start_y):
+                self.get_logger().error("[SEQ] Abort: failed to reach START pose")
+                return
+
         # 1) Publish inflated table collision
         self.update_obstacle(inflate=True)
 
@@ -849,13 +960,16 @@ def main(args=None):
     rclpy.init(args=args)
     node = SimpleRodGrab()
 
-    node.execute_sequence()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
 
-    for _ in range(50):
-        rclpy.spin_once(node, timeout_sec=0.1)
+    try:
+        executor.spin()
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
-    node.destroy_node()
-    rclpy.shutdown()
 
 
 if __name__ == "__main__":

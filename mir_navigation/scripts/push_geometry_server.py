@@ -203,7 +203,7 @@ class PushGeometryServer(Node):
             self.get_parameter("dir_order")
             .get_parameter_value()
             .string_array_value
-            or ["+X", "-X", "+Y", "-Y"]
+            or ["-X", "+X", "+Y", "-Y"]
         )
 
         self.get_logger().info("[PUSH_GEOM] Node ready (services + subscriptions up).")
@@ -802,8 +802,12 @@ class PushGeometryServer(Node):
     def _handle_compute_side_peek_points(self, request, response):
         """
         Planner → box info.
-        Node   → returns ALL valid side-peek poses for all free dirs.
+        Node   → returns side-peek poses.
+        RULE:
+        - If +X is FREE → return ONLY +X
+        - Else → return all free dirs (fallback)
         """
+
         result_list = self._compute_side_peek_targets(
             box_x=request.box_x,
             box_y=request.box_y,
@@ -817,13 +821,27 @@ class PushGeometryServer(Node):
             response.n = 0
             return response
 
-        n = len(result_list)
-        self.get_logger().info(f"[SIDE_PEEK] Computed {n} side-peek dir candidates.")
+        # -------------------------------
+        # 🔴 FORCE +X IF PRESENT
+        # -------------------------------
+        plus_x = [t for t in result_list if t.get("dir") == "+X"]
+        if plus_x:
+            self.get_logger().info(
+                "[SIDE_PEEK] +X is FREE → returning ONLY +X direction"
+            )
+            self.get_logger().info(f"[SIDE_PEEK] +X data: {plus_x[0]}")
+            result_list = plus_x
+        else:
+            self.get_logger().info(
+                "[SIDE_PEEK] +X not available → returning all free directions"
+            )
 
+        # -------------------------------
+        # Fill response
+        # -------------------------------
         response.success = True
-        response.n = n
+        response.n = len(result_list)
 
-        # Arrays clear / fill (ROS will init empty arrays by default)
         response.dirs = []
         response.left_x = []
         response.left_y = []

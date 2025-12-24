@@ -12,14 +12,14 @@ from nav2_msgs.action import NavigateToPose
 import math
 from enum import Enum
 import time
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from graphviz import Digraph
 from action_msgs.msg import GoalStatus
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.executors import SingleThreadedExecutor   #SINGLE-THREADING for cleaner execution
 from rclpy.callback_groups import ReentrantCallbackGroup #Callback group for reentrant callbacks
 import threading # Import the threading library
-from mir_navigation.action import ObserveObstacle, CheckVisibility, ManipulateObstacle
+from mir_navigation.action import ObserveObstacle, CheckVisibility, ManipulateObstacle, PullTrigger
 from mir_navigation.srv import ComputeSidePeekPoints, ComputePreManipPose
 
 
@@ -364,6 +364,33 @@ class MotionPlanner:
             "compute_pre_manip_pose",
             callback_group=callback_group,
         )
+        
+        # Pull trigger action client (new server)
+        self.pull_client = ActionClient(
+            node,
+            PullTrigger,
+            'pull_trigger',   # IMPORTANT: yahi name tum server side pe bhi rakhna
+            callback_group=callback_group,
+        )
+
+        # --- PULL geometry clients (NEW) ---
+        self.pull_side_peek_client = node.create_client(
+            ComputeSidePeekPoints,
+            "compute_pull_side_peek_points"
+        )
+        self.pull_pre_manip_client = node.create_client(
+            ComputePreManipPose,
+            "compute_pull_pre_manip_pose",
+            callback_group=callback_group,
+        )
+
+        while not self.pull_side_peek_client.wait_for_service(timeout_sec=1.0):
+            self.node.get_logger().info("[Planner] Waiting for 'compute_pull_side_peek_points' service...")
+
+        while not self.pull_pre_manip_client.wait_for_service(timeout_sec=1.0):
+            self.node.get_logger().info("[Planner] Waiting for 'compute_pull_pre_manip_pose' service...")
+
+
 
         self.observe_client = ActionClient(
             node,
@@ -398,7 +425,7 @@ class MotionPlanner:
             "x": 6.5, "y": 0.5, "length": 0.5, "width": 2.0,
             "marker": {  # map frame pose
             "x": 6.25, "y": 0.5, "z": 0.0,
-            "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0  # I have to verify the x,y,z axis of marker.
+            "qx": 0.0, "qy": 0.0, "qz": 1.0, "qw": 0.0  # I have to verify the x,y,z axis of marker.
             }
         },
         "test_box_1": {
@@ -407,99 +434,162 @@ class MotionPlanner:
             "x": 4.60, "y": 9.10, "z": 0.88,
             "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0        ## I have to verify the x,y,z axis of marker.
             }
-        }
+        },
+        "table": {
+            "x": 7.97, "y": 0.28, "length": 0.65, "width": 0.65,
+            "marker": {                      # map frame pose
+                "x": 7.97, "y": 0.28, "z": 0.0,
+                "qx": 0.0, "qy": 0.0, "qz": -0.7071068, "qw": 0.7071068
+            }
+        },
+
         }
 
             # Add observation offsets
         self.obs_forward_offset = 2.0  # meters in front of obstacle
         self.obs_lateral_offset = 0.0  # centered laterally
         
-        
-    def compute_observation_pose(self, obstacle_name):
-        """Compute observation pose for given obstacle"""
-        if obstacle_name not in self.movable_obstacles:
-            self.node.get_logger().error(f"[OBS] Unknown obstacle: {obstacle_name}")
-            return None
-            
-        ob = self.movable_obstacles[obstacle_name]
-        marker = ob.get("marker", {})
-        
-        # Calculate angle to face the obstacle (from offset position)
-        # For now, assume obstacle is at 0 yaw (can be extended)
-        yaw = 0.0  # Default yaw
-        
-        try:
-            mx = float(marker["x"]);  my = float(marker["y"]);  # mz = float(marker["z"])  # (unused here)
-            qx = float(marker["qx"]); qy = float(marker["qy"])
-            qz = float(marker["qz"]); qw = float(marker["qw"])
-        except Exception:
-            self.node.get_logger().error(f"[OBS] Missing marker pose for obstacle '{obstacle_name}'")
-            return None
-        
-            # 1) Marker +Z (face normal) rotated into map frame, XY projection
-    #    R[:,2] (third column) of quaternion rotation matrix:
-        fx = 2.0 * (qx * qz + qy * qw)
-        fy = 2.0 * (qy * qz - qx * qw)
-        # (fz = 1 - 2*(qx*qx + qy*qy))  # not needed; we work on the ground plane
 
-        # normalize XY forward; fallback to +X if degenerate
-        norm = math.hypot(fx, fy)
-        if norm < 1e-6:
+
+
+
+    def compute_observation_pose(self, obstacle_name):
+        """Compute an observation pose in front of the obstacle marker (using marker yaw).
+
+        Convention:
+        - Marker orientation defines obstacle frame in map.
+        - "Forward" is marker +X axis projected onto ground (map XY).
+        - Observation goal is: marker_xy + forward*d + left*lateral
+        - Robot yaw faces the marker (look-at).
+        """
+        import math
+        from geometry_msgs.msg import PoseStamped
+
+        log = self.node.get_logger()
+
+        if obstacle_name not in self.movable_obstacles:
+            log.error(f"[OBS] Unknown obstacle: {obstacle_name}")
+            return None
+
+        ob = self.movable_obstacles[obstacle_name]
+        marker = ob.get("marker", None)
+        if not marker:
+            log.error(f"[OBS] No marker pose found for obstacle '{obstacle_name}'")
+            return None
+
+        try:
+            mx = float(marker["x"])
+            my = float(marker["y"])
+            qx = float(marker.get("qx", 0.0))
+            qy = float(marker.get("qy", 0.0))
+            qz = float(marker.get("qz", 0.0))
+            qw = float(marker.get("qw", 1.0))
+        except Exception as e:
+            log.error(f"[OBS] Bad marker data for '{obstacle_name}': {e}")
+            return None
+
+        # Normalize quaternion (robustness)
+        qnorm = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if qnorm < 1e-9:
+            qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+        else:
+            qx /= qnorm
+            qy /= qnorm
+            qz /= qnorm
+            qw /= qnorm
+
+        # Forward direction = marker +X axis in map (projected to XY)
+        # Rotation matrix first column (R00, R10) corresponds to body +X in world XY:
+        fx = 1.0 - 2.0 * (qy*qy + qz*qz)          # R00
+        fy = 2.0 * (qx*qy + qz*qw)                # R10
+
+        # Normalize XY; fallback if degenerate
+        fn = math.hypot(fx, fy)
+        if fn < 1e-6:
             fx, fy = 1.0, 0.0
         else:
-            fx /= norm; fy /= norm
-        fx = -fx
-        fy = -fy
+            fx /= fn
+            fy /= fn
 
-        # 2) Choose standoff distance d (robust default if fixed offset not set)
-        fixed = float(getattr(self, "obs_forward_offset", 0.0) or 0.0)
-        safety = float(getattr(self, "obs_safety", 0.25))
-        cammin = float(getattr(self, "camera_min_range", 0.35))
-        length = float(ob.get("length", 0.5))
+        # Left direction = marker +Y axis in map (projected to XY) for lateral offset
+        # Rotation matrix second column (R01, R11) corresponds to body +Y:
+        lx = 2.0 * (qx*qy - qz*qw)                # R01
+        ly = 1.0 - 2.0 * (qx*qx + qz*qz)          # R11
+        ln = math.hypot(lx, ly)
+        if ln < 1e-6:
+            # If degenerate, just use perpendicular to forward
+            lx, ly = -fy, fx
+        else:
+            lx /= ln
+            ly /= ln
+
+        # Distance selection
+        fixed_d = float(getattr(self, "obs_forward_offset", 0.0) or 0.0)
+        fixed_lat = float(getattr(self, "obs_lateral_offset", 0.0) or 0.0)
+
+        safety = float(getattr(self, "obs_safety_margin", 0.35) or 0.35)
+        cammin = float(getattr(self, "obs_min_distance", 0.75) or 0.75)
+        length = float(ob.get("length", 0.5) or 0.5)
+
         d_auto = 0.5 * length + safety + cammin
-        d = fixed if fixed > 0.0 else d_auto
+        d = fixed_d if fixed_d > 0.0 else d_auto
+        lateral = fixed_lat  # can be 0
 
-        # 3) Observation position = marker_xy + d * forward(+Z_projected)
-        x_obs = mx + d * fx
-        y_obs = my + d * fy
+        # Observation position: in front (+forward) and optionally to the left (+lateral)
+        x_obs = mx + d * fx + lateral * lx
+        y_obs = my + d * fy + lateral * ly
 
-        # 4) Face the marker (look-at): yaw from obs -> marker
+        # Face the marker (look-at): yaw from obs -> marker
         yaw_obs = math.atan2(my - y_obs, mx - x_obs)
 
-        # 5) Build pose (planar goal; z = 0 for base)
-        pose_stamped = PoseStamped()
-        pose_stamped.header.frame_id = "map"
-        pose_stamped.header.stamp = self.node.get_clock().now().to_msg()
-        pose_stamped.pose.position.x = x_obs
-        pose_stamped.pose.position.y = y_obs
-        pose_stamped.pose.position.z = 0.0
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = self.node.get_clock().now().to_msg()
+        pose.pose.position.x = x_obs
+        pose.pose.position.y = y_obs
+        pose.pose.position.z = 0.0
 
-        q = self._yaw_to_quaternion(yaw_obs)  # your existing helper
-        pose_stamped.pose.orientation = q
-        return pose_stamped
+        # yaw -> quaternion
+        half = 0.5 * yaw_obs
+        pose.pose.orientation.x = 0.0
+        pose.pose.orientation.y = 0.0
+        pose.pose.orientation.z = math.sin(half)
+        pose.pose.orientation.w = math.cos(half)
+
+        log.info(
+            f"[OBS] compute_observation_pose('{obstacle_name}') "
+            f"marker=({mx:.2f},{my:.2f}) forward=({fx:.3f},{fy:.3f}) "
+            f"d={d:.2f} lat={lateral:.2f} -> obs=({x_obs:.2f},{y_obs:.2f}) yaw={yaw_obs:.2f}rad"
+        )
+        return pose
+
             
 
     
 
-    def _nav_to_pose(self, pose_stamped: PoseStamped, timeout_sec: float | None = None) -> bool:
+    def _nav_to_pose(self, pose_stamped, timeout_sec=30.0, max_attempts=1, strict_timeout=False):
         """
         Send a NavigateToPose goal to Nav2 and wait for result.
 
-        Behaviour:
-        - Sirf RESULT TIMEOUT ke case mein same goal ko retry karega (max 2 attempts).
-        - Agar Nav2 hard failure status de ya goal reject ho, to retry nahi karega.
+        - pose_stamped : PoseStamped (MAP frame)
+        - strict_timeout=True  -> hard timeout (no dynamic)
+        - strict_timeout=False -> dynamic timeout allowed
         """
+        import math
+        import rclpy
+        from nav2_msgs.action import NavigateToPose
+        from action_msgs.msg import GoalStatus
+
         log = self.node.get_logger()
 
-        max_attempts = 2  # timeout par itni baar retry
-
         for attempt in range(1, max_attempts + 1):
-            # --------- 0) dynamic timeout estimate ----------
-            min_timeout = float(timeout_sec) if timeout_sec is not None else 10.0
-            k_factor = 3.0          # slack factor
-            nominal_speed = 0.30    # m/s (assumed nav speed)
 
-            # current robot pose (agar available ho)
+            # --------- 0) timeout estimate ----------
+            min_timeout = float(timeout_sec) if timeout_sec is not None else 10.0
+            k_factor = 3.0
+            nominal_speed = 0.30  # m/s
+
+            # current robot pose
             try:
                 rx, ry, _ = self.node.planner.q_current
             except Exception:
@@ -508,10 +598,7 @@ class MotionPlanner:
             gx = float(pose_stamped.pose.position.x)
             gy = float(pose_stamped.pose.position.y)
 
-            dx = gx - rx
-            dy = gy - ry
-            straight_dist = math.hypot(dx, dy)
-
+            straight_dist = math.hypot(gx - rx, gy - ry)
             path_length_est = max(straight_dist, 0.5)
 
             if nominal_speed > 1e-6:
@@ -519,14 +606,21 @@ class MotionPlanner:
             else:
                 dyn_timeout = min_timeout
 
-            timeout_effective = max(min_timeout, dyn_timeout)
-
-            log.info(
-                f"[NAV] (attempt {attempt}/{max_attempts}) "
-                f"Computed dynamic timeout for goal "
-                f"(x={gx:.2f}, y={gy:.2f}) -> {timeout_effective:.1f}s "
-                f"(min={min_timeout:.1f}, dist≈{path_length_est:.2f} m)"
-            )
+            # 🔐 strict vs dynamic
+            if strict_timeout:
+                timeout_effective = min_timeout
+                log.info(
+                    f"[NAV] (attempt {attempt}/{max_attempts}) "
+                    f"STRICT timeout enabled -> {timeout_effective:.1f}s"
+                )
+            else:
+                timeout_effective = max(min_timeout, dyn_timeout)
+                log.info(
+                    f"[NAV] (attempt {attempt}/{max_attempts}) "
+                    f"Computed dynamic timeout for goal "
+                    f"(x={gx:.2f}, y={gy:.2f}) -> {timeout_effective:.1f}s "
+                    f"(min={min_timeout:.1f}, dist≈{path_length_est:.2f} m)"
+                )
 
             # 1) Wait for action server
             if not self.nav_client.wait_for_server(timeout_sec=5.0):
@@ -539,57 +633,55 @@ class MotionPlanner:
 
             log.info(
                 f"[NAV] (attempt {attempt}/{max_attempts}) Sending goal to Nav2: "
-                f"x={pose_stamped.pose.position.x:.2f}, "
-                f"y={pose_stamped.pose.position.y:.2f}"
+                f"x={gx:.2f}, y={gy:.2f}"
             )
 
-            # 3) Send goal asynchronously
+            # 3) Send goal
             send_goal_future = self.nav_client.send_goal_async(goal_msg)
+            rclpy.spin_until_future_complete(self.node, send_goal_future, timeout_sec=5.0)
 
-            # 4) Wait for goal handle
-            rclpy.spin_until_future_complete(self.node, send_goal_future, timeout_sec=timeout_effective)
             if not send_goal_future.done():
-                log.warn(f"[NAV] (attempt {attempt}) Timed out waiting for goal handle")
-                # yahan retry ka matlab nahi banta, server hi respond nahi kar raha
+                log.warn("[NAV] Timed out waiting for goal handle")
                 return False
 
             goal_handle = send_goal_future.result()
             if not goal_handle or not goal_handle.accepted:
-                log.warn(f"[NAV] (attempt {attempt}) NavigateToPose goal rejected by server")
-                return False  # hard failure, no retry
+                log.warn("[NAV] Goal rejected by Nav2")
+                return False
 
-            # 5) Wait for result with SAME effective timeout
+            # 4) Wait for result
             result_future = goal_handle.get_result_async()
             rclpy.spin_until_future_complete(self.node, result_future, timeout_sec=timeout_effective)
+
             if not result_future.done():
-                # 👉 ye hai RESULT TIMEOUT case jisme hum retry karna chahte hain
-                log.warn(f"[NAV] (attempt {attempt}) Timed out waiting for Nav2 result, canceling goal")
+                log.warn("[NAV] Timed out waiting for Nav2 result, canceling goal")
                 try:
-                    goal_handle.cancel_goal_async()
+                    cancel_future = goal_handle.cancel_goal_async()
+                    rclpy.spin_until_future_complete(self.node, cancel_future, timeout_sec=2.0)
                 except Exception:
                     pass
 
                 if attempt < max_attempts:
-                    log.warn("[NAV] Timeout occurred, retrying same goal once more...")
-                    continue  # next attempt
+                    log.warn("[NAV] Retrying same goal once more...")
+                    continue
                 else:
-                    log.warn("[NAV] Timeout occurred again on last attempt, giving up.")
+                    log.warn("[NAV] Final attempt timed out, giving up")
                     return False
 
-            # yahan aaya matlab Nav2 ne result diya
+            # 5) Result received
             result = result_future.result()
             status = result.status
 
             if status == GoalStatus.STATUS_SUCCEEDED:
-                log.info(f"[NAV] NavigateToPose SUCCEEDED ✅ (attempt {attempt})")
+                log.info("[NAV] NavigateToPose SUCCEEDED ✅")
                 return True
-            else:
-                # 👉 hard Nav2 failure: ABORTED / CANCELED / UNKNOWN etc.
-                log.warn(f"[NAV] NavigateToPose FAILED with status={status} (attempt {attempt}), not retrying.")
-                return False
 
-        # theoretically yahan nahi aana chahiye
+            log.warn(f"[NAV] NavigateToPose FAILED with status={status}, not retrying")
+            return False
+
         return False
+
+
 
 
 
@@ -659,14 +751,26 @@ class MotionPlanner:
                 log.info("[NAV] Starting NAVIGATE_TO_VIS_POINT")
 
                 obstacle = params.get("obstacle")
-                if obstacle is None:
+                if not obstacle:
                     log.warn("[NAV_VIS] No obstacle specified in params")
                     return ExecutionResult(success=False, failure_type="NO_OBSTACLE_NAME")
 
+                mode = self.obstacle_manip_mode.get(obstacle, "Push_Movable")
+                geom_client = self.side_peek_client if mode == "Push_Movable" else self.pull_side_peek_client
+                log.info(f"[NAV_VIS] Using geometry mode={mode} for obstacle={obstacle}")
+
+
+
+
+                obstacle = params.get("obstacle")
+                if obstacle is None:
+                    log.warn("[NAV_VIS] No obstacle specified in params")
+                    return ExecutionResult(success=False, failure_type="NO_OBSTACLE_NAME")
+                
                 if obstacle not in self.movable_obstacles:
                     log.warn(f"[NAV_VIS] Obstacle '{obstacle}' not found in movable_obstacles")
                     return ExecutionResult(success=False, failure_type="UNKNOWN_OBSTACLE")
-
+                
                 ob = self.movable_obstacles[obstacle]
                 box_x = float(ob["x"])
                 box_y = float(ob["y"])
@@ -681,7 +785,7 @@ class MotionPlanner:
                 req.box_w = box_w
 
                 log.info("[NAV_VIS] Requesting side-peek points from push node...")
-                future = self.side_peek_client.call_async(req)
+                future = geom_client.call_async(req)
                 rclpy.spin_until_future_complete(self.node, future)
                 res = future.result()
 
@@ -730,7 +834,8 @@ class MotionPlanner:
                             f"[NAV_VIS] Trying dir={dtag}, side={side_name} "
                             f"with side-peek ({cx:.2f}, {cy:.2f}, {math.degrees(cyaw):.1f}°)"
                         )
-
+                        if obstacle == "test_box":
+                            cx, cy, cyaw = (6.75, -1.25, 0.0)
                         vis_pose = self._create_pose_stamped([cx, cy, cyaw])
                         last_goal_pose = vis_pose
 
@@ -779,13 +884,13 @@ class MotionPlanner:
                         blocking_obstacle=ctx.get("blocking_obstacle"),
                     )
 
-                # ---- success: store dir + L* for push ----
-                bx, by, byaw = best_pose
-                vis_dir = best_dir
-                self.obstacle_dirs[obstacle] = vis_dir
+
+
+                bx, by, byaw = (6.75, -1.25, 0.0)
+                self.obstacle_dirs[obstacle] = best_dir
                 self.obstacle_lstar[obstacle] = float(best_lstar)
 
-                log.info(f"[NAV_VIS] Stored vis_dir={vis_dir} for obstacle={obstacle}")
+                log.info(f"[NAV_VIS] Stored vis_dir={best_dir} for obstacle={obstacle}")
                 log.info(f"[NAV_VIS] Stored L*={best_lstar:.2f} for obstacle={obstacle}")
                 log.info(
                     f"[NAV_VIS] Final selected vis-point = "
@@ -803,6 +908,26 @@ class MotionPlanner:
             # ------------------------------------------------------------------
             elif label == "NAVIGATE_TO_PRE_MANIP_POINT":
                 log.info("[NAV] Starting NAVIGATE_TO_PRE_MANIP_POINT")
+
+                obstacle = params.get("obstacle")
+                if not obstacle:
+                    log.warn("[NAV_PRE] No obstacle specified in params")
+                    return ExecutionResult(success=False, failure_type="NO_OBSTACLE_NAME")
+                
+
+                mode = self.obstacle_manip_mode.get(obstacle, "Push_Movable")
+
+                # ✅ PULL CASE: pre-manip navigation skip
+                if mode == "Pull_Movable":
+                    log.info(f"[PRE_MANIP][PULL] Skipping NAVIGATE_TO_PRE_MANIP_POINT for obstacle={obstacle} (directly go to MANIPULATE_OBSTACLE)")
+                    return ExecutionResult(success=True)
+
+                pre_client = self.pre_manip_client if mode == "Push_Movable" else self.pull_pre_manip_client
+                log.info(f"[PRE_MANIP] Using geometry mode={mode} for obstacle={obstacle}")
+
+
+                log.info(f"[PRE_MANIP] Using geometry mode={mode} for obstacle={obstacle}")
+
 
                 # 1. Obstacle from params
                 obstacle = params.get("obstacle")
@@ -838,7 +963,7 @@ class MotionPlanner:
                 req.dir   = vis_dir
 
                 log.info("[PRE_MANIP] Requesting pre-manip pose from push node...")
-                future = self.pre_manip_client.call_async(req)
+                future = pre_client.call_async(req)
                 rclpy.spin_until_future_complete(self.node, future)
                 res = future.result()
 
@@ -900,7 +1025,14 @@ class MotionPlanner:
 
                 # Build pose
                 final_pose = self._create_pose_stamped([goal_x, goal_y, goal_yaw])
-                nav_ok = self._nav_to_pose(final_pose)
+                # FINAL GOAL: strict navigation
+                nav_ok = self._nav_to_pose(
+                    final_pose,
+                    timeout_sec=30.0,   # ✅ fixed 30 seconds
+                    max_attempts=1,      # ✅ sirf ek hi attempt
+                    strict_timeout=True
+                )
+
 
                 if not nav_ok:
                     log.warning("[NAV_FINAL] Navigation to final goal failed")
@@ -1030,15 +1162,17 @@ class MotionPlanner:
                 # 6) Map action result → ExecutionResult
                 if action_result.success:
                     mode = (action_result.label or "").strip()
+                    low = mode.lower()
+                    if low in ("pullable_movable", "pull_movable", "pull_movable", "pullable", "pull_movable"):
+                        mode = "Pull_Movable"
+                    elif low in ("push_movable", "pushable_movable", "pushable"):
+                        mode = "Push_Movable"
                     log.info(
                         f"[OBS][YOLO] Observation succeeded | "
                         f"label='{mode}' | msg='{action_result.message}'"
                     )
-                    if mode not in ("Push_Movable", "pullable_movable"):
-                        log.error(
-                            f"[OBS][YOLO] Unknown manipulation mode '{mode}' "
-                            f"for obstacle={obstacle}"
-                        )
+                    if mode not in ("Push_Movable", "Pull_Movable"):
+                        log.error(f"[OBS][YOLO] Unknown manipulation mode '{mode}' for obstacle={obstacle}")
                         return ExecutionResult(
                             success=False,
                             failure_type="UNKNOWN_MANIP_MODE",
@@ -1142,17 +1276,26 @@ class MotionPlanner:
                     )
 
                 blocked = bool(getattr(action_result, "obstacle_present", True))
+                resolved_name = (getattr(action_result, "obstacle_name", "") or "").strip()
+
                 if blocked:
                     log.warning(f"[OBS][VIS] Visibility check: OBSTACLE PRESENT for {obstacle}")
-                else:
-                    log.info(f"[OBS][VIS] Visibility check: area clear for {obstacle}")
 
-                # Abhi ke liye: action execution success treat karte hain,
-                # 'blocked' ko context me store kar dete hain.
-                return ExecutionResult(
-                    success=True,
-                    failure_context={"obstacle": obstacle, "blocked": blocked},
-                )
+                    # ✅ IMPORTANT: blocked => planner ko manipulate-issue do
+                    return ExecutionResult(
+                        success=False,
+                        failure_type="MANIPULATION_ISSUE",
+                        blocking_obstacle=None,  # abhi unknown, resolver pick karega
+                        failure_context={
+                            "reason": "OBSTACLE_IN_LSTAR_REGION",
+                            "hint_obstacle": resolved_name,  # ✅ THIS IS THE KEY (hint)
+                        },
+                    )
+
+                log.info(f"[OBS][VIS] Visibility check: area clear for {obstacle}")
+                return ExecutionResult(success=True)
+
+
 
             # -------------------------------
             # UNKNOWN LABEL (safety)
@@ -1302,40 +1445,106 @@ class MotionPlanner:
                     failure_type="PUSH_FAILED",
                     failure_context={"obstacle": obstacle, "message": msg},
                 )
-            
 
-        elif mode == "pullable_movable":
-            # 👉 Yaha PULL strategy (alag motion, maybe different action)
-            log.info(f"[MANIP] Running PULL strategy for obstacle={obstacle}")
+        elif mode == "Pull_Movable":
+            log.info(f"[MANIP][PULL] Running PULL strategy for obstacle={obstacle}")
+
+            # 1) wait for pull action server
+            if not self.pull_client.wait_for_server(timeout_sec=5.0):
+                log.error("[MANIP][PULL] pull_trigger action server not available")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="PULL_ACTION_UNAVAILABLE",
+                    failure_context={"obstacle": obstacle},
+                )
+
+            # 2) build goal (boolean trigger only)
+            goal = PullTrigger.Goal()
+            goal.trigger = True
+
+            # 3) send goal
+            try:
+                send_goal_future = self.pull_client.send_goal_async(goal)
+                rclpy.spin_until_future_complete(self.node, send_goal_future)
+                goal_handle = send_goal_future.result()
+            except Exception as exc:
+                log.error(f"[MANIP][PULL] Exception while sending goal: {exc!r}")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="PULL_GOAL_SEND_ERROR",
+                    failure_context=str(exc),
+                )
+
+            if goal_handle is None or not goal_handle.accepted:
+                log.error("[MANIP][PULL] PullTrigger goal was rejected.")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="PULL_GOAL_REJECTED",
+                    failure_context={"obstacle": obstacle},
+                )
+
+            log.info("[MANIP][PULL] Goal accepted. Waiting for result...")
+
+            # 4) wait result
+            try:
+                result_future = goal_handle.get_result_async()
+                rclpy.spin_until_future_complete(self.node, result_future)
+                action_result = result_future.result().result
+            except Exception as exc:
+                log.error(f"[MANIP][PULL] Exception while waiting for result: {exc!r}")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="PULL_RESULT_ERROR",
+                    failure_context=str(exc),
+                )
+
+            # 5) map action result -> ExecutionResult
+            ok = bool(getattr(action_result, "success", False))
+            if ok:
+                log.info("[MANIP][PULL] Pull succeeded ✅")
+                return ExecutionResult(success=True)
+            else:
+                log.error("[MANIP][PULL] Pull failed ❌")
+                return ExecutionResult(
+                    success=False,
+                    failure_type="PULL_FAILED",
+                    failure_context={"obstacle": obstacle},
+                )
+
+
+    def _point_to_segment_distance(self, px, py, ax, ay, bx, by) -> float:
+        """
+        Distance from point P(px,py) to segment AB(ax,ay)->(bx,by).
+        """
+        abx = bx - ax
+        aby = by - ay
+        apx = px - ax
+        apy = py - ay
+
+        ab2 = abx * abx + aby * aby
+        if ab2 < 1e-12:
+            # A and B are same point
+            return math.hypot(px - ax, py - ay)
+
+        t = (apx * abx + apy * aby) / ab2  # projection factor
+        if t < 0.0:
+            cx, cy = ax, ay
+        elif t > 1.0:
+            cx, cy = bx, by
         else:
-            log.error(f"[MANIP] Unexpected manip mode '{mode}' for obstacle={obstacle}")
-            return ExecutionResult(
-                success=False,
-                failure_type="UNKNOWN_MANIP_MODE",
-                failure_context={"obstacle": obstacle, "mode": mode},
-            )
+            cx = ax + t * abx
+            cy = ay + t * aby
 
-    def _navigation_failure_result(self, goal_pose, raw_failure_type, extra_context=None):
-        """Invoke analyzer and package a standard manipulation-issue failure."""
-        failure_type, failure_context = self._analyze_navigation_failure(None, goal_pose)
-        failure_context["raw_failure_type"] = raw_failure_type
-        if extra_context:
-            failure_context.update(extra_context)
+        return math.hypot(px - cx, py - cy)    
 
-        return ExecutionResult(
-            success=False,
-            failure_type=failure_type,
-            failure_context=failure_context,
-        )
 
     def _nearest_movable_obstacle(
         self,
         goal_pose,
         max_robot_dist: float = 3.0,
-        corridor_half_width: float = 0.8,
-        path_stride: int = 3,
+        corridor_half_width: float = 1.2,
+        path_stride: int = 1,
     ):
-
         """
         Path-based 'first blocking along path' obstacle picker.
 
@@ -1344,52 +1553,105 @@ class MotionPlanner:
         2) Obstacle Nav2 ke actual planned path corridor me ho
         3) Path ke order me sabse pehle jo obstacle milta hai -> wahi blocker
 
-        Args:
-            goal_pose: PoseStamped of goal (not heavily used here, but kept for API consistency).
-            max_robot_dist: Robot se max distance jiske andar obstacle "near robot" maana jayega.
-            corridor_half_width: Path ke around corridor half width (meters).
-            path_stride: Waypoints skip factor (1 = every point, 2 = every 2nd point, etc.)
-
         Returns:
             obstacle_name (str) or None
         """
+
         log = self.node.get_logger()
 
-        # -------------- robot pose --------------
+        # ---------------- robot pose ----------------
         planner = getattr(self.node, "planner", None)
         if planner is None or not hasattr(planner, "q_current"):
             log.warn("[NAV_FAIL] planner/q_current not available; cannot infer blocking obstacle")
             return None
 
         rx, ry, _ = planner.q_current
+        log.info(f"[NAV_FAIL][DBG] q_current(rx,ry)=({rx:.3f},{ry:.3f})")
 
-        # -------------- nav2 path --------------
+        # ---------------- nav2 path ----------------
         nav_path = getattr(self.node, "nav_path", None) or []
         if len(nav_path) < 2:
             log.warn("[NAV_FAIL] nav_path empty/too short; cannot do path-based blocking check")
             return None
 
-        # -------------- movable obstacles --------------
+        stride = max(1, int(path_stride))
+        p0x, p0y = nav_path[0]
+        pmx, pmy = nav_path[len(nav_path) // 2]
+        plx, ply = nav_path[-1]
+        log.info(
+            "[NAV_FAIL][DBG] nav_path sample: "
+            f"p0=({p0x:.3f},{p0y:.3f}) mid=({pmx:.3f},{pmy:.3f}) last=({plx:.3f},{ply:.3f}) "
+            f"len={len(nav_path)} stride={stride}"
+        )
+
+        # quick sanity: robot -> path sampled min distance
+        try:
+            dmin_robot_path = min(
+                math.hypot(px - rx, py - ry) for (px, py) in nav_path[::stride]
+            )
+            log.info(f"[NAV_FAIL][DBG] min_dist(robot->path_sampled)={dmin_robot_path:.3f}m")
+        except Exception as e:
+            log.warn(f"[NAV_FAIL][DBG] could not compute min_dist(robot->path): {e}")
+
+        # ---------------- movable obstacles ----------------
         movable = getattr(self, "movable_obstacles", None) or {}
         if not movable:
             log.warn("[NAV_FAIL] No movable_obstacles available")
             return None
 
+        # Debug each obstacle distances (robot + path min)
+        for name, ob in movable.items():
+            try:
+                ox, oy = float(ob["x"]), float(ob["y"])
+            except Exception:
+                log.warn(f"[NAV_FAIL][DBG] obs='{name}' invalid x/y; raw={ob}")
+                continue
+
+            d_robot = math.hypot(ox - rx, oy - ry)
+            try:
+                d_path_min = min(math.hypot(px - ox, py - oy) for (px, py) in nav_path[::stride])
+            except Exception:
+                d_path_min = float("nan")
+
+            log.info(
+                f"[NAV_FAIL][DBG] obs='{name}' pos=({ox:.3f},{oy:.3f}) "
+                f"d_robot={d_robot:.3f} d_path_min(sampled)={d_path_min:.3f} "
+                f"thr_robot={max_robot_dist:.2f} thr_corr={corridor_half_width:.2f}"
+            )
+
         # Find closest waypoint index to robot -> start checking from there
         def d2(a, b):
-            return (a[0] - b[0])**2 + (a[1] - b[1])**2
+            return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
 
         i_r = min(range(len(nav_path)), key=lambda i: d2(nav_path[i], (rx, ry)))
+        cpx, cpy = nav_path[i_r]
+        d_closest = math.hypot(cpx - rx, cpy - ry)
 
         log.info(
             f"[NAV_FAIL] Path-based blocking search | "
             f"start_idx={i_r}/{len(nav_path)} | "
-            f"max_robot_dist={max_robot_dist:.2f} | corridor={corridor_half_width:.2f}"
+            f"closest_wp=({cpx:.3f},{cpy:.3f}) dist={d_closest:.3f} | "
+            f"max_robot_dist={max_robot_dist:.2f} | corridor={corridor_half_width:.2f} | stride={stride}"
         )
 
+        # Throttled scan debug
+        dbg_every_n = 30  # log every ~30 scanned points (after stride applied)
+
+        scanned = 0
+        near_hits = 0
+        corridor_hits = 0
+
         # Iterate path forward from robot's closest point
-        for i in range(i_r, len(nav_path), max(1, int(path_stride))):
-            px, py = nav_path[i]
+        for i in range(i_r, len(nav_path) - 1, stride):
+            ax, ay = nav_path[i]
+            bx, by = nav_path[i + 1]
+
+            scanned += 1
+
+            do_dbg = (scanned % dbg_every_n == 0)
+
+            if do_dbg:
+                log.info(f"[NAV_FAIL][DBG] scanning path_idx={i} wp=({ax:.3f},{ay:.3f})")
 
             # Check each obstacle for corridor + near-robot condition
             for name, ob in movable.items():
@@ -1397,24 +1659,36 @@ class MotionPlanner:
                     ox = float(ob["x"])
                     oy = float(ob["y"])
                 except Exception:
-                    log.warn(f"[NAV_FAIL] Obstacle '{name}' has invalid x/y; skipping")
+                    # already logged above, keep quiet here
                     continue
 
-                # (1) near robot check
                 dist_robot = math.hypot(ox - rx, oy - ry)
                 if dist_robot > max_robot_dist:
                     continue
 
-                # (2) corridor check: obstacle close to this path waypoint
-                dist_path = math.hypot(ox - px, oy - py)
+                near_hits += 1
+
+                dist_path = self._point_to_segment_distance(ox, oy, ax, ay, bx, by)
                 if dist_path <= corridor_half_width:
+                    corridor_hits += 1
                     log.info(
                         f"[NAV_FAIL] First blocking obstacle found: '{name}' "
                         f"at path_idx={i} | dist_robot={dist_robot:.2f} | dist_path={dist_path:.2f}"
                     )
                     return name
 
-        log.warn("[NAV_FAIL] No blocking obstacle found along Nav2 path corridor")
+                if do_dbg:
+                    # show near-robot but not corridor
+                    log.info(
+                        f"[NAV_FAIL][DBG] near-but-not-corridor obs='{name}' "
+                        f"dist_robot={dist_robot:.2f} dist_path={dist_path:.2f} "
+                        f"(corr_thr={corridor_half_width:.2f})"
+                    )
+
+        log.warn(
+            f"[NAV_FAIL] No blocking obstacle found along Nav2 path corridor | "
+            f"scanned_pts={scanned} near_hits={near_hits} corridor_hits={corridor_hits}"
+        )
         return None
 
 
@@ -1849,38 +2123,34 @@ class VANAMOPlanner:
         if result.new_position:
             self.q_current = result.new_position
 
-        # Find which obstacle is blocking
-        obstacle = getattr(result, 'blocking_obstacle', None)
+        # 1) Try direct blocking_obstacle (nav-failure case)
+        obstacle = getattr(result, "blocking_obstacle", None)
+
+        # 2) If not present, use hint from visibility failure_context
+        if obstacle is None:
+            ctx = getattr(result, "failure_context", {}) or {}
+            hint = ctx.get("hint_obstacle")  # ✅ comes from VISIBILITY_ACTION snippet above
+
+            if not hint:
+                self.node.get_logger().error("Manipulation issue but no hint_obstacle in failure_context")
+                self.planning_state = PlanningState.FAILED
+                return False
+
+            obstacle = hint
+
         if not obstacle:
-            self.node.get_logger().error("No blocking obstacle found for manipulation")
+            self.node.get_logger().error("No blocking obstacle resolved for manipulation")
             self.planning_state = PlanningState.FAILED
             return False
-        
+
         self.node.get_logger().info(f"Handling manipulation issue with obstacle: {obstacle}")
 
-        # Get obstacle position
-        if obstacle not in self.motion_planner.movable_obstacles:
-            self.node.get_logger().error(f"Unknown obstacle: {obstacle}")
-            self.planning_state = PlanningState.FAILED
-            return False
-
         manip_graph = self.aog_module.expand_graph_for_manipulation(obstacle, self.q_goal)
-
-
         self.graph_network.append(manip_graph)
         self.current_graph_index = len(self.graph_network) - 1
-
-        # === Add this for visualization ===
         visualize_graph_structure_graphviz(manip_graph, f"plan_graph_{len(self.graph_network)}")
-
-        self.node.get_logger().info(f"Created manipulation graph for obstacle: {obstacle}")
-        
-        # DEBUG: Check planning state after graph creation
-        self.node.get_logger().info(f"DEBUG: Planning state after manipulation graph creation: {self.planning_state}")
-        self.node.get_logger().info(f"DEBUG: Current graph index: {self.current_graph_index}")
-        self.node.get_logger().info(f"DEBUG: Total graphs: {len(self.graph_network)}")
-        
         return True
+
     
 
     
@@ -1948,12 +2218,12 @@ class VANAMOPlannerNode(Node):
         self.callback_group = ReentrantCallbackGroup()
         
         # Subscribe to odometry
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/diff_cont/odom',
-            self.odom_callback, 
-            10, callback_group=self.callback_group
-        )
+        # self.odom_sub = self.create_subscription(
+        #     Odometry,
+        #     '/diff_cont/odom',
+        #     self.odom_callback, 
+        #     10, callback_group=self.callback_group
+        # )
 
 
         # Declare parameters
@@ -1988,12 +2258,19 @@ class VANAMOPlannerNode(Node):
             10
         )
         
-        self.pose_sub = self.create_subscription(
-            PoseStamped,
-            'robot_pose',
-            self.pose_callback,
+        # self.pose_sub = self.create_subscription(
+        #     PoseStamped,
+        #     'robot_pose',
+        #     self.pose_callback,
+        #     10
+        # )
+        self.amcl_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            '/amcl_pose',
+            self.amcl_pose_callback,
             10
         )
+
         self.get_logger().info("VANAMO Planner Node initialized")
 
 
@@ -2061,8 +2338,7 @@ class VANAMOPlannerNode(Node):
         old_pos = self.planner.q_current.copy()
         
         # Update planner
-        self.planner.q_current = [x, y, yaw]
-
+        # self.planner.q_current = [x, y, yaw]
 
 
     def goal_callback(self, msg):
@@ -2076,16 +2352,31 @@ class VANAMOPlannerNode(Node):
         self.get_logger().info(f"New goal received: {goal_pose}")
         self.planner.set_goal(goal_pose)
     
-    def pose_callback(self, msg):
-        """Handle robot pose updates"""
-        new_pose = [
-            msg.pose.position.x,
-            msg.pose.position.y,
-            self._quaternion_to_yaw(msg.pose.orientation)
-        ]
+    # def pose_callback(self, msg):
+    #     """Handle robot pose updates"""
+    #     new_pose = [
+    #         msg.pose.position.x,
+    #         msg.pose.position.y,
+    #         self._quaternion_to_yaw(msg.pose.orientation)
+    #     ]
         
-        # Update planner with current pose
-        self.planner.q_current = new_pose
+    #     # Update planner with current pose
+    #     self.planner.q_current = new_pose
+    def amcl_pose_callback(self, msg: PoseWithCovarianceStamped):
+        """
+        AMCL pose is in 'map' frame (usually). This should match Nav2 path frame.
+        """
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+
+        x = p.x
+        y = p.y
+        yaw = self._quaternion_to_yaw(q)
+
+        self.planner.q_current = [x, y, yaw]
+        self.get_logger().info(f"[POSE][AMCL] q_current=({x:.3f},{y:.3f})")
+
+
     
     def _get_graph_info(self):
         """Get current graph information for monitoring"""

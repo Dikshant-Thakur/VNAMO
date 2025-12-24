@@ -4,5 +4,5 @@ float32 duration_sec
 
 ---
 bool obstacle_present  
-
+string obstacle_name
 ---

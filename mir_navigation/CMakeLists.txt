@@ -43,6 +43,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/CheckVisibility.action"
   "action/ObserveObstacle.action"
   "action/GrabPoint.action"
+  "action/PullTrigger.action"
   "srv/ComputePreManipPose.srv"
   "srv/ComputeSidePeekPoints.srv"
   DEPENDENCIES builtin_interfaces action_msgs std_msgs geometry_msgs
@@ -88,10 +89,16 @@ install(PROGRAMS scripts/visibility_action.py
   RENAME visibility_action
 )
 
-# lstar_obstacle_checker -> visibility_action
+# pull action server
 install(PROGRAMS scripts/pull_action_server.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME pull_action_server
+)
+
+# pull action geometry server
+install(PROGRAMS scripts/pull_geometry_server.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME pull_geometry_server
 )
 
 

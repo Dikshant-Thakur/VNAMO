@@ -44,4 +44,26 @@ def generate_launch_description():
             emulate_tty=True,
             prefix='gnome-terminal --title=visibility_action -- bash -c',
         ),
+        
+                # 4) Pull Action Server
+        Node(
+            package='mir_navigation',
+            executable='pull_action_server',
+            name='pull_action_server',
+            output='screen',
+            emulate_tty=True,
+            prefix='gnome-terminal --title=pull_action_server -- bash -c',
+        ),
+        
+        Node(
+            package='mir_navigation',
+            executable='pull_geometry_server',
+            name='pull_geometry_server',
+            output='screen',
+            emulate_tty=True,
+            prefix='gnome-terminal --title=pull_geometry_server -- bash -c',
+        ),
+
+        
+        
     ])

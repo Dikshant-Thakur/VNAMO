@@ -57,10 +57,6 @@ class ArucoNavigator(Node):
     def __init__(self) -> None:
         super().__init__("observe_obstacle_action_node")
 
-        self._yolo_timer = None
-        self._active_obstacle_name = ""
-
-
         # ---------------- State flags ----------------
         self.alignment_active = False
         self.sent_goal = False
@@ -188,10 +184,6 @@ class ArucoNavigator(Node):
         obstacle_name = getattr(goal_handle.request, "obstacle_name", "")
         self.get_logger().info(f"[OBS_ACT] Start observation for obstacle='{obstacle_name}'")
 
-        self._active_obstacle_name = obstacle_name
-
-
-
         if obstacle_name == "test_box":
             self.marker_pose_map.pose.position.x = 6.25
             self.marker_pose_map.pose.position.y = 0.6
@@ -246,8 +238,6 @@ class ArucoNavigator(Node):
         )
 
         self._current_goal_handle = None
-        self._active_obstacle_name = ""
-
         return result
 
     # ============================================================
@@ -587,50 +577,6 @@ class ArucoNavigator(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to enable YOLO: {e}")
             self._fail_observation(str(e))
-        # start/replace 10s timeout timer
-        if self._yolo_timer is not None:
-            try:
-                self._yolo_timer.cancel()
-            except Exception:
-                pass
-            self._yolo_timer = None
-
-        self._yolo_timer = self.create_timer(10.0, self._yolo_timeout_cb)
-
-    def _yolo_timeout_cb(self):
-        # one-shot: stop timer first
-        if self._yolo_timer is not None:
-            try:
-                self._yolo_timer.cancel()
-            except Exception:
-                pass
-            self._yolo_timer = None
-
-        # only apply for test_box + only if label not received
-        if self._active_obstacle_name != "test_box":
-            return
-        if self.last_label:
-            return
-
-        # only if we are still waiting for yolo
-        if not self.armed or self.home_goal_active:
-            return
-
-        # ✅ fake label
-        self.get_logger().warn("[OBS_ACT] YOLO >10s for test_box → faking label='Push_Movable'")
-        self.last_label = "Push_Movable"
-
-        # ✅ keep rest behavior same as yolo-detected path:
-        self.armed = False
-        try:
-            self.yolo_node.set_enabled(False)
-        except Exception:
-            pass
-
-        self.home_goal_active = True
-        self._send_return_to_home_goal()
-
-
 
     def send_rotate_in_place_goal(self, target_pose_stamped: PoseStamped) -> None:
         if not self.moveit_action_client.wait_for_server(timeout_sec=5.0):
@@ -721,13 +667,6 @@ class ArucoNavigator(Node):
             self.yolo_node.set_enabled(False)
         except Exception:
             pass
-
-        if self._yolo_timer is not None:
-            try:
-                self._yolo_timer.cancel()
-            except Exception:
-                pass
-            self._yolo_timer = None
 
         self.home_goal_active = True
         self._send_return_to_home_goal()
