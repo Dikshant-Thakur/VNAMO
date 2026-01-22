@@ -75,12 +75,11 @@ ros2 launch mir_navigation amcl.py use_sim_time:=true map:=$(ros2 pkg prefix mir
 ```
 
 Acknowledgements & Credits
-This project is built upon the excellent work done by **Rudresh Lonkar**.
 
 * **Base Project Inspiration:** [mir250_robot_ros2](https://github.com/Rudresh172/mir250_robot_ros2) by Rudresh172.
 * **MiR Descriptions:** [mir_robot](https://github.com/DFKI-NI/mir_robot) by DFKI-NI.
-* [cite_start]**Universal Robots:** [Universal_Robots_ROS2_Description](https://github.com/UniversalRobots/Universal_Robots_ROS2_Description)[cite: 21].
-* [cite_start]**Laser Tools:** [dual_laser_merger](https://github.com/pradyum/dual_laser_merger)[cite: 2].
+* **Universal Robots:** [Universal_Robots_ROS2_Description](https://github.com/UniversalRobots/Universal_Robots_ROS2_Description)[cite: 21].
+* **Laser Tools:** [dual_laser_merger](https://github.com/pradyum/dual_laser_merger)[cite: 2].
 
 ## Video - Glimpse of Computer Vision + Navigation of Mir + Ur5e.
 https://github.com/user-attachments/assets/84e8e1ee-dfe1-44b1-96c8-f438b1279440
