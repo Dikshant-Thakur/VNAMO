@@ -23,9 +23,9 @@ mkdir -p ~/ros2_ws_simulation/src
 cd ~/ros2_ws_simulation/src
 
 # Clone this repository
-git clone <YOUR_GITHUB_REPO_LINK_HERE> .
+git clone <https://github.com/Dikshant-Thakur/VNAMO.git> .
 ```
-###3. Install Dependencies
+### 3. Install Dependencies
 This project requires both ROS 2 packages and Python libraries for YOLO/AI.
 Step A: Import External Repos (via vcs)
 ```bash
