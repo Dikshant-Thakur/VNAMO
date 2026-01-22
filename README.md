@@ -2,11 +2,7 @@ This repository contains a ROS 2 Humble package for simulating a **MiR 250 (Mobi
 
 The project integrates **Navigation2**, **SLAM Toolbox**, and **YOLOv8** for autonomous navigation and object detection in a Gazebo environment.
 
-## Video - Glimpse of Computer Vision + Navigation of Mir + Ur5e.
-https://github.com/user-attachments/assets/84e8e1ee-dfe1-44b1-96c8-f438b1279440
-
-
-## ⚡ Key Features
+## Key Features
 * **Base Setup:** Derived from the robust [mir250_robot_ros2](https://github.com/Rudresh172/mir250_robot_ros2) structure.
 * **Sensor Fusion:** Merges dual laser scanners (Front & Back) using `ira_laser_tools` for 360° coverage.
 * **Perception:** Real-time object detection using **YOLOv8** (CUDA-accelerated) via `ros2_run`.
@@ -85,3 +81,7 @@ This project is built upon the excellent work done by **Rudresh Lonkar**.
 * **MiR Descriptions:** [mir_robot](https://github.com/DFKI-NI/mir_robot) by DFKI-NI.
 * [cite_start]**Universal Robots:** [Universal_Robots_ROS2_Description](https://github.com/UniversalRobots/Universal_Robots_ROS2_Description)[cite: 21].
 * [cite_start]**Laser Tools:** [dual_laser_merger](https://github.com/pradyum/dual_laser_merger)[cite: 2].
+
+## Video - Glimpse of Computer Vision + Navigation of Mir + Ur5e.
+https://github.com/user-attachments/assets/84e8e1ee-dfe1-44b1-96c8-f438b1279440
+
