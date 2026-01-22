@@ -1,72 +1,87 @@
-# mir_250_ros2
-This is a ROS2 package for MiR 250 with ros2_control, Gazebo and Ignition Gazebo simulation.
+# Autonomous Mobile Manipulator (MiR 250 + UR5e + YOLO)
 
-![alt text](gazebo.png)
-![alt text](navigation.png)
+This repository contains a ROS 2 Humble package for simulating a **MiR 250 (Mobile Industrial Robot)** equipped with a **Universal Robots (UR5e)** arm and a **Robotiq Gripper**.
 
-## Video - Glimpse of Computer Vision + Navigation of Mir + Ur5e.
-https://github.com/user-attachments/assets/84e8e1ee-dfe1-44b1-96c8-f438b1279440
+The project integrates **Navigation2**, **SLAM Toolbox**, and **YOLOv8** for autonomous navigation and object detection in a Gazebo environment.
 
+![Simulation Environment](gazebo.png)
+![Navigation Map](navigation.png)
 
-# Installation
+## 🎥 Video Demo
+*(Yahan apni video ka link daal dena agar future mein upload karo)*
 
-## Preliminaries
-## ROS2
-If you haven't already installed [ROS2](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html) on your PC, you need to add the ROS2 apt repository.
+---
 
-## Source install
-```
-# create a ros2 workspace
-mkdir -p ~/ros2_ws/src
-cd ~/ros2_ws/
+## ⚡ Key Features
+* **Base Setup:** Derived from the robust [mir250_robot_ros2](https://github.com/Rudresh172/mir250_robot_ros2) structure.
+* **Sensor Fusion:** Merges dual laser scanners (Front & Back) using `ira_laser_tools` for 360° coverage.
+* **Perception:** Real-time object detection using **YOLOv8** (CUDA-accelerated) via `ros2_run`.
+* **Manipulation:** UR5e arm control with MoveIt and `ros2_control`.
+* **Synchronization:** Implements `twist_stamper` to fix TF synchronization issues for velocity commands.
 
-# clone mir_robot into the ros2 workspace
-git clone https://git.rwth-aachen.de/rudresh.lonkar/mir_250_ros2/ src/mir_robot
+---
 
-# use vcs to fetch linked repos
-# $ sudo apt install python3-vcstool
-vcs import < src/mir_robot/ros2.repos src --recursive
+## 📦 Installation
 
-# use rosdep to install all dependencies (including ROS itself)
+### 1. Preliminaries (ROS 2)
+Ensure you have [ROS 2 Humble](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html) installed on Ubuntu 22.04.
+
+### 2. Setup Workspace
+Create a workspace and clone this repository:
+```bash
+mkdir -p ~/ros2_ws_simulation/src
+cd ~/ros2_ws_simulation/src
+
+# Clone this repository
+git clone <YOUR_GITHUB_REPO_LINK_HERE> .
+
+Step A: Import External Repos (via vcs)
+# Ensure vcstool is installed
+sudo apt install python3-vcstool
+
+# Import dependencies defined in ros2.repos (e.g., mir_robot, ur_description)
+vcs import < ros2.repos . --recursive
+
+Step B: Install ROS Dependencies (rosdep)
+cd ~/ros2_ws_simulation
 sudo apt update
 sudo apt install -y python3-rosdep
-rosdep update --rosdistro=humble
+sudo rosdep init
+rosdep update
 rosdep install --from-paths src --ignore-src -r -y --rosdistro humble
 
-# build all packages in the workspace
-source /opt/ros/humble/setup.bash
-cd ~/ros2_ws
-colcon build
-```
-You must source the workspace in each terminal you want to work in:
-```
-source ~/ros2_ws/install/setup.bash
-```
 
-# Gazebo demo (mapping)
-```
-### gazebo:
-ros2 launch mir_gazebo mir_gazebo_launch.py world:=maze
-
-### mapping (slam_toolbox)
-ros2 launch mir_navigation mapping.py use_sim_time:=true slam_params_file:=$(ros2 pkg prefix mir_navigation)/share/mir_navigation/config/mir_mapping_async_sim.yaml
-
-### navigation (optional)
-ros2 launch mir_navigation navigation.py use_sim_time:=true cmd_vel_w_prefix:=/diff_cont/cmd_vel_unstamped
-```
-
-# Gazebo demo (Navigation with existing map)
-```
-### gazebo
-ros2 launch mir_gazebo mir_gazebo_launch.py world:=maze rviz_config_file:=$(ros2 pkg prefix mir_navigation)/share/mir_navigation/rviz/mir_nav.rviz
+Step C: Install Python Libraries (YOLO & Vision)
+pip install ultralytics opencv-python opencv-contrib-python
+# Install PyTorch with CUDA support (verify your CUDA version)
+pip3 install torch torchvision --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
 
 
-### localization (existing map)
-ros2 launch mir_navigation amcl.py use_sim_time:=true map:=$(ros2 pkg prefix mir_navigation)/share/mir_navigation/maps/maze.yaml
+4. Build the Project
+cd ~/ros2_ws_simulation
+colcon build --symlink-install
+source install/setup.bash
 
-### navigation
+🖥️ Usage
+1. Launch Simulation (Gazebo)
+To spawn the MiR 250 with UR arm and start the laser merger nodes:
+ros2 launch mir_gazebo mir_simulation_launch.py world:=maze
+
+2. Navigation & Mapping
+
+To start SLAM (Mapping):
+ros2 launch mir_navigation mapping.py use_sim_time:=true
+
+To start Navigation (AMCL + Nav2):
 ros2 launch mir_navigation navigation.py use_sim_time:=true
-```
 
-## Acknowledgement
-The 3d files for MiR 250 are from [DFKI](https://github.com/DFKI-NI/mir_robot).
+🙏 Acknowledgements & Credits
+This project is built upon the excellent work done by Rudresh Lonkar.
+Base Project Inspiration: mir250_robot_ros2 by Rudresh172.
+
+MiR Descriptions: DFKI-NI/mir_robot.
+
+Universal Robots: Universal_Robots_ROS2_Description.
+
+Laser Tools: dual_laser_merger.
+

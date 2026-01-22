@@ -108,20 +108,20 @@ class PushGeometryServer(Node):
         self.deterministic_poses = {
             "unit_box_0": {
                 "dir": "+X",
-                "pre_manip": (3.2, -0.5, 0.0),           # (x, y, yaw) - yaw=0 for +X
-                "side_peek": (4.55, -2.5, 0.0),          # (x, y, yaw) - facing +X
+                "pre_manip": (4.8, -0.21, 0.0),           # (x, y, yaw) - yaw=0 for +X
+                "side_peek": (4.55, -2.25, 0.0),          # (x, y, yaw) - facing +X
                 "l_star": 2.0,                             # usable corridor length (adjust as needed)
             },
             "unit_box_1": {
                 "dir": "+X",
                 "pre_manip": (3.52, -3.13, 0.0),          # (x, y, yaw) - yaw=0 for +X
-                "side_peek": (4.79, -4.24, 0.0),         # (x, y, yaw) - facing +X
+                "side_peek": (4.54, -1.775, 0.0),         # (x, y, yaw) - facing +X
                 "l_star": 2.0,
             },
             "unit_box": {
                 "dir": "+Y",
                 "pre_manip": (2.15, -0.44, math.pi / 2.0),  # (x, y, yaw) - yaw=π/2 for +Y
-                "side_peek": (4.8, 1.3, math.pi / 2.0),    # (x, y, yaw) - facing +Y
+                "side_peek": (4.54, 1.3, math.pi / 2.0),    # (x, y, yaw) - facing +Y
                 "l_star": 2.0,
             },
         }

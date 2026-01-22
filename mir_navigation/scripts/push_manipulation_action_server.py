@@ -62,7 +62,10 @@ class ManipulateObstacleServer(Node):
 
         # (optional) known obstacles (abhi sirf names, pose/size use nahi)
         self._obstacles: Dict[str, ObstacleInfo] = {
-            "test_box": ObstacleInfo(name="test_box"),
+            "test_box":   ObstacleInfo(name="test_box"),
+            "unit_box":   ObstacleInfo(name="unit_box"),
+            "unit_box_0": ObstacleInfo(name="unit_box_0"),
+            "unit_box_1": ObstacleInfo(name="unit_box_1"),
         }
 
         # ---------- State ----------

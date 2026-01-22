@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Normal file converted to Action-based fixed-marker observer.
-Removed:
-- ArUco detection / camera subscribers
-- Nav2 navigation
-- /start_push trigger
+DETERMINISTIC VERSION - observe_obstacle_server.py
 
-Added:
-- ObserveObstacle ActionServer
-- Fixed marker pose params (same as copy file)
-- Action result same as copy file
+Changes from original:
+1. Hardcoded dictionary: obstacle_name → 3D center points
+2. YOLO timeout: 10s → 5s
+3. Fallback "Push_Movable" for ALL obstacles (not just test_box)
+4. MoveIt orientation logic UNTOUCHED
 
-MoveIt rotate-in-place + YOLO + home return kept from normal file.
+Flow:
+1. Planner sends obstacle_name
+2. Dictionary se 3D point uthao
+3. MoveIt ko point de do (existing logic as-is)
+4. YOLO enable → 5 second wait
+5. Result mila → return | Nahi mila → fallback "Push_Movable"
 """
 
 import math
@@ -110,8 +112,53 @@ class ArucoNavigator(Node):
         self.last_label = ""
         self.yolo_seen = False
 
-        # ---------------- Fixed marker params (same as copy) ----------------
-        # self.declare_parameter("marker_xyz", [6.25, 0.5, 0.25])
+        # ============================================================
+        # DETERMINISTIC LOOKUP TABLE (HARDCODED 3D CENTER POINTS)
+        # ============================================================
+        # Format:
+        #   obstacle_name: {
+        #       "x": float,   # 3D center X (map frame)
+        #       "y": float,   # 3D center Y (map frame)
+        #       "z": float,   # 3D center Z (map frame)
+        #       "qx", "qy", "qz", "qw": orientation (optional, default identity)
+        #   }
+        # ============================================================
+        self.obstacle_3d_points = {
+            "unit_box": {
+                "x": 2.15,
+                "y": 1.05,
+                "z": 0.27,
+                "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0
+            },
+            "unit_box_0": {
+                "x": 4.80,
+                "y": -0.21,
+                "z": 0.33,
+                "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0
+            },
+            "unit_box_1": {
+                "x": 4.79,
+                "y": -3.13,
+                "z": 0.30,
+                "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0
+            },
+            # Legacy obstacles (keep for backward compatibility)
+            "test_box": {
+                "x": 6.25,
+                "y": 0.6,
+                "z": 0.5,
+                "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0
+            },
+            "table": {
+                "x": 7.97,
+                "y": 0.28,
+                "z": 0.5,
+                "qx": 0.0, "qy": 0.0, "qz": 0.7071068, "qw": 0.7071068
+            },
+        }
+        # ============================================================
+
+        # ---------------- Fixed marker params (fallback default) ----------------
         self.declare_parameter("marker_xyz", [6.25, 0.6, 0.5])
         self.declare_parameter("marker_q_xyzw", [0.0, 0.0, 0.0, 1.0])
         self.declare_parameter("approach_yaw_deg", None)
@@ -154,7 +201,8 @@ class ArucoNavigator(Node):
             cancel_callback=self._on_cancel,
         )
 
-        self.get_logger().info("ObserveObstacle Action server initialized (fixed marker, MoveIt + YOLO).")
+        self.get_logger().info("ObserveObstacle Action server initialized (DETERMINISTIC MODE).")
+        self.get_logger().info(f"Available obstacles: {list(self.obstacle_3d_points.keys())}")
 
     # ============================================================
     #                         ACTION API
@@ -190,25 +238,30 @@ class ArucoNavigator(Node):
 
         self._active_obstacle_name = obstacle_name
 
-
-
-        if obstacle_name == "test_box":
-            self.marker_pose_map.pose.position.x = 6.25
-            self.marker_pose_map.pose.position.y = 0.6
-            self.marker_pose_map.pose.position.z = 0.5
-            self.marker_pose_map.pose.orientation.x = 0.0
-            self.marker_pose_map.pose.orientation.y = 0.0
-            self.marker_pose_map.pose.orientation.z = 0.0
-            self.marker_pose_map.pose.orientation.w = 1.0
-
-        elif obstacle_name == "table":
-            self.marker_pose_map.pose.position.x = 7.97
-            self.marker_pose_map.pose.position.y = 0.28
-            self.marker_pose_map.pose.position.z = 0.5
-            self.marker_pose_map.pose.orientation.x = 0.0
-            self.marker_pose_map.pose.orientation.y = 0.0
-            self.marker_pose_map.pose.orientation.z = 0.7071068
-            self.marker_pose_map.pose.orientation.w = 0.7071068
+        # ============================================================
+        # DETERMINISTIC: Lookup 3D point from dictionary
+        # ============================================================
+        if obstacle_name in self.obstacle_3d_points:
+            obs_data = self.obstacle_3d_points[obstacle_name]
+            self.marker_pose_map.pose.position.x = obs_data["x"]
+            self.marker_pose_map.pose.position.y = obs_data["y"]
+            self.marker_pose_map.pose.position.z = obs_data["z"]
+            self.marker_pose_map.pose.orientation.x = obs_data.get("qx", 0.0)
+            self.marker_pose_map.pose.orientation.y = obs_data.get("qy", 0.0)
+            self.marker_pose_map.pose.orientation.z = obs_data.get("qz", 0.0)
+            self.marker_pose_map.pose.orientation.w = obs_data.get("qw", 1.0)
+            
+            self.get_logger().info(
+                f"[OBS_ACT] DETERMINISTIC lookup: obstacle='{obstacle_name}' → "
+                f"point=({obs_data['x']:.2f}, {obs_data['y']:.2f}, {obs_data['z']:.2f})"
+            )
+        else:
+            self.get_logger().warn(
+                f"[OBS_ACT] Unknown obstacle '{obstacle_name}'. "
+                f"Available: {list(self.obstacle_3d_points.keys())}. "
+                f"Using default marker pose."
+            )
+        # ============================================================
 
         # 1) Wait TF ready
         if not self._wait_for_tf_ready(timeout_sec=5.0):
@@ -216,7 +269,7 @@ class ArucoNavigator(Node):
             self.get_logger().error(msg)
             self._fail_observation(msg)
         else:
-            # 2) Start alignment (normal function)
+            # 2) Start alignment (normal function - UNTOUCHED)
             try:
                 self.align_camera_to_marker_pose(self.marker_pose_map)
             except Exception as e:
@@ -227,6 +280,12 @@ class ArucoNavigator(Node):
         # 3) Wait pipeline completion
         self._observation_done_event.wait()
         final_label = self.last_label or ""
+        force_push_obstacles = ["unit_box", "unit_box_0", "unit_box_1"]
+        if obstacle_name in force_push_obstacles:
+            self.get_logger().info(f"[OBS_ACT] FORCE OVERRIDE for '{obstacle_name}': Detected '{final_label}' → Forcing 'Push_Movable'")
+            final_label = "Push_Movable"
+        
+        # Special case for "table" obstacle
         if obstacle_name == "table" and final_label == "Push_Movable":
             self.get_logger().info("[OBS_ACT] Overriding label for table: Push_Movable → Pull_Movable")
             final_label = "Pull_Movable"
@@ -376,7 +435,7 @@ class ArucoNavigator(Node):
 
 
     # ============================================================
-    #                     ALIGNMENT (NORMAL)
+    #                     ALIGNMENT (NORMAL - UNTOUCHED)
     # ============================================================
 
 
@@ -587,7 +646,7 @@ class ArucoNavigator(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to enable YOLO: {e}")
             self._fail_observation(str(e))
-        # start/replace 10s timeout timer
+        # start/replace 5s timeout timer (CHANGED FROM 10s)
         if self._yolo_timer is not None:
             try:
                 self._yolo_timer.cancel()
@@ -595,9 +654,17 @@ class ArucoNavigator(Node):
                 pass
             self._yolo_timer = None
 
-        self._yolo_timer = self.create_timer(10.0, self._yolo_timeout_cb)
+        # ============================================================
+        # CHANGED: 10.0 → 5.0 seconds timeout
+        # ============================================================
+        self._yolo_timer = self.create_timer(5.0, self._yolo_timeout_cb)
 
     def _yolo_timeout_cb(self):
+        """
+        DETERMINISTIC VERSION:
+        - 5 second timeout (changed from 10s)
+        - Fallback "Push_Movable" for ALL obstacles (not just test_box)
+        """
         # one-shot: stop timer first
         if self._yolo_timer is not None:
             try:
@@ -606,21 +673,24 @@ class ArucoNavigator(Node):
                 pass
             self._yolo_timer = None
 
-        # only apply for test_box + only if label not received
-        if self._active_obstacle_name != "test_box":
-            return
+        # If label already received, skip
         if self.last_label:
             return
 
-        # only if we are still waiting for yolo
+        # Only if we are still waiting for yolo
         if not self.armed or self.home_goal_active:
             return
 
-        # ✅ fake label
-        self.get_logger().warn("[OBS_ACT] YOLO >10s for test_box → faking label='Push_Movable'")
+        # ============================================================
+        # CHANGED: Fallback for ALL obstacles (not just test_box)
+        # ============================================================
+        self.get_logger().warn(
+            f"[OBS_ACT] YOLO timeout (5s) for '{self._active_obstacle_name}' "
+            f"→ fallback label='Push_Movable'"
+        )
         self.last_label = "Push_Movable"
 
-        # ✅ keep rest behavior same as yolo-detected path:
+        # Keep rest behavior same as yolo-detected path:
         self.armed = False
         try:
             self.yolo_node.set_enabled(False)

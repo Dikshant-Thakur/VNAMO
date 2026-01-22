@@ -167,6 +167,24 @@ class VisibilityActionServer(Node):
                 "length": 0.65,   # <-- apni table ka actual length daal do
                 "width":  0.65,   # <-- apni table ka actual width daal do
 		},
+            "unit_box": {
+                "x": 2.15, 
+                "y": 1.05, 
+                "length": 3.28, 
+                "width": 0.96
+            },
+            "unit_box_0": {
+                "x": 4.80, 
+                "y": -0.21, 
+                "length": 1.0, 
+                "width": 3.12
+            },
+            "unit_box_1": {
+                "x": 4.79, 
+                "y": -3.13, 
+                "length": 0.66, 
+                "width": 1.21
+            },
 
         }
 
@@ -993,7 +1011,7 @@ class VisibilityActionServer(Node):
 
             if self._job_state == "WAIT_INIT_ORIENT":
                 if self._moveit_motion_done():
-                    # ✅ Dummy table mode: after first MoveIt orient, finish as CLEAR
+                    # ✅ Dummy mode: after first MoveIt orient, finish as CLEAR
                     if getattr(self, "_dummy_one_move_clear", False):
                         self.get_logger().info("[DUMMY_CLEAR] Init orient done -> finishing success as CLEAR (no obstacle).")
                         self._obst_detected = False
@@ -1073,7 +1091,7 @@ class VisibilityActionServer(Node):
         )
 
         obst_name = (goal.obstacle_name or "").strip()
-        self._dummy_one_move_clear = (obst_name in ("table", "test_box"))
+        self._dummy_one_move_clear = (obst_name in ("table", "test_box", "unit_box", "unit_box_0", "unit_box_1"))
 
         if not obst_name:
             self.get_logger().warn("[ACT] Empty obstacle_name in goal, aborting.")

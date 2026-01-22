@@ -1,4 +1,5 @@
 # Request
+string obstacle_name   # <-- NEW
 float32 box_x
 float32 box_y
 float32 box_l

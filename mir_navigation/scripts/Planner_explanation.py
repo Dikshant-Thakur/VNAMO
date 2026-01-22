@@ -14,6 +14,8 @@ from enum import Enum
 import time
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from graphviz import Digraph
+import os
+from datetime import datetime
 from action_msgs.msg import GoalStatus
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.executors import SingleThreadedExecutor   #SINGLE-THREADING for cleaner execution
@@ -71,6 +73,8 @@ class ExecutionResult:
         self.blocked_region = blocked_region  # For visibility issues
         self.blocking_obstacle = blocking_obstacle  # For manipulation issues
         self.failure_context = failure_context  # Additional context
+
+
     def __str__(self):
         if self.success:
             return "ExecutionResult(SUCCESS)"
@@ -208,7 +212,8 @@ class AOGModule:
         return new_graph
 
 
-    def expand_graph_for_manipulation(self, obstacle, q_goal):
+    def expand_graph_for_manipulation(self, obstacle, q_goal, include_final=True):
+
         """Manip + Visibility structure (existing AOGGraph API)."""
         new_graph = AOGGraph()
 
@@ -220,7 +225,6 @@ class AOGModule:
         n_vis_done         = new_graph.add_node("N_VIS_DONE",          node_type="flag")
         n_q_pre_manip      = new_graph.add_node("N_Q_PRE_MANIP",      node_type="navigation")
         n_manip_done       = new_graph.add_node("N_MANIPULATION_DONE", node_type="flag")
-        n_final            = new_graph.add_node("N_FINAL",             node_type="final")
 
         # Main path: current -> observation point
         new_graph.add_hyperarc(
@@ -275,13 +279,15 @@ class AOGModule:
         )
 
         # Final navigation (optional) → N_FINAL
-        new_graph.add_hyperarc(
-            parent=n_final,
-            children=[n_manip_done],
-            action="NAVIGATE_TO_FINAL_GOAL",
-            action_params={"q_goal": q_goal},
-            condition=lambda: True
-        )
+        if include_final:
+            n_final = new_graph.add_node("N_FINAL", node_type="final")
+            new_graph.add_hyperarc(
+                parent=n_final,
+                children=[n_manip_done],
+                action="NAVIGATE_TO_FINAL_GOAL",
+                action_params={"q_goal": q_goal},
+                condition=lambda: True
+            )
 
         # Initialize arc statuses based on children (existing utility)
         self._update_initial_arc_statuses(new_graph)
@@ -421,37 +427,37 @@ class MotionPlanner:
         
         # Hardcoded movable obstacles (for thesis simplicity)
         self.movable_obstacles = {
-        "test_box": {
-            "x": 6.5, "y": 0.5, "length": 0.5, "width": 2.0,
-            "marker": {  # map frame pose
-            "x": 6.25, "y": 0.5, "z": 0.0,
-            "qx": 0.0, "qy": 0.0, "qz": 1.0, "qw": 0.0  # I have to verify the x,y,z axis of marker.
-            }
-        },
-        "test_box_1": {
-            "x": 4.64, "y": 9.15, "length": 0.25, "width": 0.25,
-            "marker": {
-            "x": 4.60, "y": 9.10, "z": 0.88,
-            "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0        ## I have to verify the x,y,z axis of marker.
-            }
-        },
-        "table": {
-            "x": 7.97, "y": 0.28, "length": 0.65, "width": 0.65,
-            "marker": {                      # map frame pose
-                "x": 7.97, "y": 0.28, "z": 0.0,
-                "qx": 0.0, "qy": 0.0, "qz": -0.7071068, "qw": 0.7071068
-            }
-        },
 
+            "unit_box": {
+                "x": 2.15, "y": 1.05, "length": 3.28, "width": 0.96,
+                "marker": {
+                    "x": 2.15, "y": 1.05, "z": 0.27,
+                    "qx": 0.0, "qy": 0.0, "qz": 1.0, "qw": 0.0
+                }
+            },
+
+            "unit_box_0": {
+                "x": 4.80, "y": -0.21, "length": 1.0, "width": 3.12,
+                "marker": {
+                    "x": 4.80, "y": -0.21, "z": 0.33,
+                    "qx": 0.0, "qy": 0.0, "qz": 1.0, "qw": 0.0
+                }
+            },
+
+            "unit_box_1": {
+                "x": 4.79, "y": -3.13, "length": 0.66, "width": 1.21,
+                "marker": {
+                    "x": 4.79, "y": -3.13, "z": 0.30,
+                    "qx": 0.0, "qy": 0.0, "qz": 1.0, "qw": 0.0
+                }
+            }
         }
 
             # Add observation offsets
-        self.obs_forward_offset = 2.0  # meters in front of obstacle
+        self.obs_forward_offset = 3.0  # meters in front of obstacle
         self.obs_lateral_offset = 0.0  # centered laterally
-        
-
-
-
+        self.obs_safety_margin = 0.35  # safety margin
+        self.obs_min_distance = 0.75  # minimum distance
 
     def compute_observation_pose(self, obstacle_name):
         """Compute an observation pose in front of the obstacle marker (using marker yaw).
@@ -779,6 +785,7 @@ class MotionPlanner:
 
                 # ---- call push geometry service ----
                 req = ComputeSidePeekPoints.Request()
+                req.obstacle_name = obstacle
                 req.box_x = box_x
                 req.box_y = box_y
                 req.box_l = box_l
@@ -834,8 +841,6 @@ class MotionPlanner:
                             f"[NAV_VIS] Trying dir={dtag}, side={side_name} "
                             f"with side-peek ({cx:.2f}, {cy:.2f}, {math.degrees(cyaw):.1f}°)"
                         )
-                        if obstacle == "test_box":
-                            cx, cy, cyaw = (6.75, -1.25, 0.0)
                         vis_pose = self._create_pose_stamped([cx, cy, cyaw])
                         last_goal_pose = vis_pose
 
@@ -886,7 +891,6 @@ class MotionPlanner:
 
 
 
-                bx, by, byaw = (6.75, -1.25, 0.0)
                 self.obstacle_dirs[obstacle] = best_dir
                 self.obstacle_lstar[obstacle] = float(best_lstar)
 
@@ -894,12 +898,12 @@ class MotionPlanner:
                 log.info(f"[NAV_VIS] Stored L*={best_lstar:.2f} for obstacle={obstacle}")
                 log.info(
                     f"[NAV_VIS] Final selected vis-point = "
-                    f"({bx:.2f}, {by:.2f}, {math.degrees(byaw):.1f}°)"
+                    f"({best_pose[0]:.2f}, {best_pose[1]:.2f}, {math.degrees(best_pose[2]):.1f}°)"
                 )
 
                 return ExecutionResult(
                     success=True,
-                    new_position=[bx, by, byaw]
+                    new_position=list(best_pose)
                 )
 
 
@@ -956,6 +960,7 @@ class MotionPlanner:
 
                 # 4. Call push node to get pre-manip pose
                 req = ComputePreManipPose.Request()
+                req.obstacle_name = obstacle
                 req.box_x = box_x
                 req.box_y = box_y
                 req.box_l = box_l
@@ -1787,6 +1792,25 @@ class VANAMOPlanner:
         self.current_graph_index = 0
         self.position_threshold = 0.5
 
+        # --------- Recovery Mode ----------
+        self.arc_retry_counts = {}
+        self.max_arc_retries = 15
+
+        # --------- META GRAPH (recursive view) ----------
+        self.meta_dot = Digraph(comment="Recursive Plan Graph (Meta)")
+        self.meta_dot.attr(rankdir="LR")  # left-to-right
+
+        self.plan_uid_counter = 0
+        self.current_plan_uid = None  # which plan cluster we are in
+
+        # child_plan_uid -> info (parent_uid, reason, obstacle, resume_arc)
+        self.plan_links = []
+
+        # output file (single growing diagram)
+        self.meta_graph_filename = "plan_graph_recursive"
+
+
+
         #lstar
         self.obstacle_lstar: dict[str, float] = {}
 
@@ -1803,6 +1827,62 @@ class VANAMOPlanner:
         # Planning state
         self.planning_state = PlanningState.INITIALIZING
         self.current_executing_arc = None
+
+        # Parent arcs active flags
+        self.parent2_active = False
+        self.plan_stack = []
+
+        # Detect obstacles in order
+        self.obstacle_order = ["unit_box", "unit_box_0", "unit_box_1"]
+        self.current_obstacle_index = 0
+
+
+    
+    
+
+    def _meta_add_plan_cluster(self, aog_graph, plan_uid: int, title: str):
+        """
+        Add one plan (AOGGraph) as a Graphviz cluster into self.meta_dot.
+        IMPORTANT: node IDs are prefixed with P{plan_uid}_ to avoid collisions.
+        """
+        cluster_name = f"cluster_P{plan_uid}"
+        prefix = f"P{plan_uid}_"
+
+        with self.meta_dot.subgraph(name=cluster_name) as c:
+            c.attr(label=f"{title} (P{plan_uid})", style="rounded")
+            c.attr(color="gray")
+
+            # Nodes
+            for name, node in aog_graph.nodes.items():
+                node_id = prefix + name
+                c.node(node_id, f"{name}\n({node.type})", shape="circle")
+
+            # Hyperarcs as edges (child -> parent like your existing viz)
+            for arc in aog_graph.hyperarcs:
+                parent_id = prefix + arc.parent.name
+                for child in arc.children:
+                    child_id = prefix + child.name
+                    c.edge(child_id, parent_id, label=arc.action)
+
+        # A "plan anchor" node for connecting parent->child cleanly
+        anchor_id = f"PLAN_P{plan_uid}"
+        self.meta_dot.node(anchor_id, f"PLAN P{plan_uid}", shape="box")
+        # connect anchor to this plan's final node (optional, but helps)
+        if "N_FINAL" in aog_graph.nodes:
+            self.meta_dot.edge(anchor_id, prefix + "N_FINAL", style="dashed")
+
+    def _meta_link_plans(self, parent_uid: int, child_uid: int, label: str):
+        """Connect parent plan to child plan in meta graph."""
+        self.meta_dot.edge(f"PLAN_P{parent_uid}", f"PLAN_P{child_uid}", label=label)
+
+    def _meta_render(self):
+        """Render ONE single PNG that grows over time."""
+        try:
+            self.meta_dot.render(self.meta_graph_filename, view=True, format="png")
+            self.node.get_logger().info(f"[META_GRAPH] Rendered {self.meta_graph_filename}.png")
+        except Exception as e:
+            self.node.get_logger().error(f"[META_GRAPH] Render failed: {e}")
+
         
     def set_goal(self, goal_pose):
         """Set new goal and reset planning"""
@@ -1841,8 +1921,13 @@ class VANAMOPlanner:
                 self.node.get_logger().info("DEBUG: Goal reached, returning SUCCESS")
                 result = "SUCCESS"
             elif self.planning_state == PlanningState.FAILED:
-                self.node.get_logger().info("DEBUG: Planning failed, returning FAILURE")
-                result = "FAILURE"
+                self.node.get_logger().info("[RECOVERY] FAILED state - resuming failed arc")
+                
+                if self.current_executing_arc:
+                    self.current_executing_arc.status = "READY"
+                
+                self.planning_state = PlanningState.PLANNING
+                result = "CONTINUE"
             else:
                 self.node.get_logger().warn(f"DEBUG: Unknown planning state: {self.planning_state}")
                 result = "FAILURE"
@@ -1870,111 +1955,203 @@ class VANAMOPlanner:
         self.current_graph_index = 0
 
         # Add this line for visualization
-        visualize_graph_structure_graphviz(root_graph, f"plan_graph_{len(self.graph_network)}")
+        # ---- META graph: add ROOT plan cluster ----
+        self.plan_uid_counter += 1
+        self.current_plan_uid = self.plan_uid_counter  # root uid
+
+        self._meta_add_plan_cluster(root_graph, self.current_plan_uid, title="ROOT PLAN")
+        self._meta_render()
 
 
         self.planning_state = PlanningState.PLANNING
         self.node.get_logger().info("VANAMO planning initialized")
         return "CONTINUE"
-    
+
     def _execute_planning_step(self):
-        """Execute one planning step"""
+        """Execute one planning step with DFS + resume semantics"""
+
+        self.node.get_logger().info(
+            f"[STEP] Active graph={self.current_graph_index}, "
+            f"stack_depth={len(self.plan_stack)}, "
+            f"parent2_active={self.parent2_active}"
+        )
+
+        # 0) Goal reached
         if self.is_goal_reached():
+            self.node.get_logger().info("[STEP] Global goal reached")
             self.planning_state = PlanningState.GOAL_REACHED
-            self.node.get_logger().info("SHOULD RETURN SUCCESS")
-            #self.planning_step()  # Trigger next planning step
             return "SUCCESS"
-
-        if self.at_goal_position() == True:
-            self.node.get_logger().info("DEBUG: Already at goal position")
-
-
-        if self.task_completed() == True:
-            self.node.get_logger().info("DEBUG: Task already completed")
-
         
-        
-        
+
+        # 1) DFS unwind: child plan finished
+        if self.task_completed() and self.plan_stack:
+            ctx = self.plan_stack.pop()
+
+            self.node.get_logger().info(
+                f"[DFS-UNWIND] Child plan finished. "
+                f"Returning to graph={ctx['graph_index']} | "
+                f"Retry arc={ctx['resume_arc'].action}"
+            )
+
+            self.current_graph_index = ctx["graph_index"]
+            self.q_current = ctx["resume_pose"]
+            self.current_plan_uid = ctx.get("plan_uid", self.current_plan_uid)
+            ctx["resume_arc"].status = "READY"
+
+            self.node.get_logger().info(
+                f"[DFS-UNWIND] Pose restored={self.q_current}, arc set READY"
+            )
+
+            return self._execute_planning_step()
+
+        # 2) Normal planning
         current_graph = self.graph_network[self.current_graph_index]
-        
-        # Find executable arcs using GNS
+
         best_arc = self.gns_module.find_best_executable_arc(current_graph)
-        
+
         if not best_arc:
-            self.node.get_logger().warn("No executable arcs found - planning failed")
-            # No executable arcs - try to expand graph or fail
+            self.node.get_logger().warn(
+                f"[GNS] No executable arcs in graph {self.current_graph_index}"
+            )
             if not self._expand_current_graph(current_graph):
+                self.node.get_logger().error("[GNS] Graph expansion failed")
                 self.planning_state = PlanningState.FAILED
                 return "FAILURE"
             return "CONTINUE"
 
-        # Check if this arc is already being executed (race condition protection)
         if best_arc.status == "EXECUTING":
-            self.node.get_logger().info(f"Arc {best_arc.action} already being executed, skipping")
+            self.node.get_logger().info(
+                f"[SKIP] Arc already EXECUTING: {best_arc.action}"
+            )
             return "CONTINUE"
 
-        # Execute the selected arc immediately (synchronous)
+        # 3) Execute arc
+        self.node.get_logger().info(
+            f"[EXEC] Executing arc={best_arc.action} "
+            f"on graph={self.current_graph_index}"
+        )
+
         best_arc.status = "EXECUTING"
         self.current_executing_arc = best_arc
-        self.node.get_logger().info(f"Executing arc: {best_arc.action}")
-        
-        # Execute the hyperarc (synchronous)
+
         execution_result = self._execute_hyperarc(best_arc)
-        
-        # Process result
+
+        # 4) SUCCESS
         if execution_result.success:
-            self.node.get_logger().info("DEBUG: Arc execution SUCCESS - updating graph")
-            best_arc.status = "COMPLETED"  # Mark as completed
+            self.node.get_logger().info(
+                f"[SUCCESS] Arc succeeded: {best_arc.action}"
+            )
+
+            best_arc.status = "COMPLETED"
             self.gns_module.update_arc_success(current_graph, best_arc)
             self._update_environment(execution_result)
-            self.node.get_logger().info(f"Arc execution succeeded: {best_arc.action}")
-            
-            # Check if goal is reached after successful execution
+            self.current_executing_arc = None
+
             if self.is_goal_reached():
-                self.node.get_logger().info("DEBUG: Goal reached after arc execution!, SHOULD RETURN SUCCESS")
+                self.node.get_logger().info(
+                    "[SUCCESS] Goal reached after arc execution"
+                )
                 self.planning_state = PlanningState.GOAL_REACHED
-                #return self._execute_planning_step() 
                 return "SUCCESS"
-            else:
-                self.planning_state = PlanningState.PLANNING
-                self.current_executing_arc = None
-                # Immediately trigger next planning step after successful execution
-                self.node.get_logger().info("DEBUG: Immediately executing next planning step after success")
-                return self._execute_planning_step()  # Recursive call for immediate execution
-                self.get_logger().info(f"CALLBACK DEBUG: planning_callback called, state: {self.planner.planning_state}")
-                #return "CONTINUE"  # Return to continue planning normally
-                
 
-                
-        else:
-            self.node.get_logger().info("DEBUG: Arc execution FAILED")
-            best_arc.status = "FAILED"
-            self.node.get_logger().warn(f"Arc execution failed: {execution_result.failure_type}")
+            return self._execute_planning_step()
+
+        # 5) FAILURE
+        self.node.get_logger().warn(
+            f"[FAIL] Arc failed: {best_arc.action} | "
+            f"type={execution_result.failure_type}"
+        )
+
+
+        if execution_result.failure_type == "MANIPULATION_ISSUE":
+            best_arc.status = "READY"
+
+            # ROOT → Parent Plan 2
+            if self.current_graph_index == 0 and not self.parent2_active:
+                self.node.get_logger().warn(
+                    "[ROOT->PARENT2] Root plan blocked. "
+                    "Creating Parent Plan 2"
+                )
+
+                self.plan_stack.append({
+                    "graph_index": 0,
+                    "resume_arc": best_arc,
+                    "resume_pose": list(self.q_current),
+                    "plan_uid": self.current_plan_uid,
+                })
+
+                self.parent2_active = True
+
+                self.node.get_logger().info(
+                    f"[STACK] Pushed root context | depth={len(self.plan_stack)}"
+                )
+
+                self._handle_manipulation_issue(
+                    execution_result,
+                    include_final=True
+                )
+                return self._execute_planning_step()
+
+            # DFS child creation
+            self.node.get_logger().warn(
+                "[DFS] Parent Plan 2 blocked. Creating child manipulation plan"
+            )
+
+            self.plan_stack.append({
+                "graph_index": self.current_graph_index,
+                "resume_arc": best_arc,
+                "resume_pose": list(self.q_current),
+                "plan_uid": self.current_plan_uid,
+            })
+
+            self.node.get_logger().info(
+                f"[STACK] Child pushed | depth={len(self.plan_stack)}"
+            )
+
+            self._handle_manipulation_issue(
+                execution_result,
+                include_final=False
+            )
+            return self._execute_planning_step()
+
+        # Non-manipulation failure
+
+        arc_id = f"{best_arc.action}_{best_arc.parent.name}"
+        
+        # Initialize or increment retry count
+        if arc_id not in self.arc_retry_counts:
+            self.arc_retry_counts[arc_id] = 0
+        self.arc_retry_counts[arc_id] += 1
+        
+        retry_count = self.arc_retry_counts[arc_id]
+        
+        self.node.get_logger().warn(
+            f"[RECOVERY] Non-manipulation failure | "
+            f"Arc: {best_arc.action} | "
+            f"Retry: {retry_count}/{self.max_arc_retries}"
+        )
+        
+        # Check if we should retry
+        if retry_count < self.max_arc_retries:
+            # RECOVERY: Arc ko READY mark karo
+            best_arc.status = "READY"
+            self.current_executing_arc = None
             
-            # Handle failure - DON'T set planning state to FAILED yet for manipulation issues
-            if execution_result.failure_type == "MANIPULATION_ISSUE":
-                self.node.get_logger().info("DEBUG: Handling manipulation issue - keeping state as PLANNING")
-                success = self._handle_manipulation_issue(execution_result)
-                if success:
-                    self.planning_state = PlanningState.PLANNING
-                    self.current_executing_arc = None
-                    self.node.get_logger().info("DEBUG: After manipulation handling - State: PLANNING, Graph: {}/{}".format(
-                        self.current_graph_index + 1, len(self.graph_network)))
-                    
-                    # Immediately trigger next planning step after manipulation graph creation
-                    self.node.get_logger().info("DEBUG: Immediately executing next planning step after manipulation")
-                    return self._execute_planning_step()  # Recursive call for immediate execution
-                    return "CONTINUE"
+            self.node.get_logger().info(
+                f"[RECOVERY] Arc '{best_arc.action}' marked READY for retry"
+            )
+            return self._execute_planning_step() 
+        else:
+            # Max retries exceeded - actually fail
+            self.node.get_logger().error(
+                f"[FATAL] Max retries ({self.max_arc_retries}) exceeded for "
+                f"arc '{best_arc.action}'. Planning FAILED."
+            )
+            best_arc.status = "FAILED"
+            self.planning_state = PlanningState.FAILED
+            self.current_executing_arc = None
+            return "FAILURE"
 
-                else:
-                    self.node.get_logger().info("DEBUG: Manipulation handling failed - setting state to FAILED")
-                    self.planning_state = PlanningState.FAILED
-                    return "FAILURE"
-            else:
-                self.node.get_logger().info("DEBUG: Non-manipulation failure - setting state to FAILED")
-                self.planning_state = PlanningState.FAILED
-                return "FAILURE"
-    
     def _execute_hyperarc(self, arc):
             """
             Dispatch a hyperarc to the right executor based on its action label.
@@ -2083,75 +2260,104 @@ class VANAMOPlanner:
         
         return [viewpoint_x, viewpoint_y, 0.0]  # x, y, theta
     
-    def _handle_visibility_issue(self, result):
-        """Handle visibility problems by adding observation nodes"""
-        if result.new_position:  
-            self.q_current = result.new_position
-        
-        # Calculate viewpoint
-        q_view = self.calculate_viewpoint(result.blocked_region, self.q_current)
-        
-        if q_view is None:
-            self.planning_state = PlanningState.FAILED
-            return False
-        
-        # Check for cycles
-        state_key = self._get_state_key(self.q_current, q_view)
-        if state_key in self.visited_states:
-            self.planning_state = PlanningState.FAILED
-            return False
-        self.visited_states.add(state_key)
-        
-        # Create new graph for visibility
-        visibility_graph = self.aog_module.expand_graph_for_visibility(q_view, self.q_goal)
-        
-        # Add to graph network
-        self.graph_network.append(visibility_graph)
-        self.current_graph_index = len(self.graph_network) - 1
-        
-        # === Add this for visualization ===
-        visualize_graph_structure_graphviz(visibility_graph, f"plan_graph_{len(self.graph_network)}")
-        
-        self.node.get_logger().info(f"Created visibility graph with viewpoint: {q_view}")
-        return True
-    
-        # Spatial reasoning utility functions
-    
-
-
-    def _handle_manipulation_issue(self, result):
+    def _handle_manipulation_issue(self, result, include_final: bool):
         if result.new_position:
             self.q_current = result.new_position
 
-        # 1) Try direct blocking_obstacle (nav-failure case)
-        obstacle = getattr(result, "blocking_obstacle", None)
-
-        # 2) If not present, use hint from visibility failure_context
-        if obstacle is None:
-            ctx = getattr(result, "failure_context", {}) or {}
-            hint = ctx.get("hint_obstacle")  # ✅ comes from VISIBILITY_ACTION snippet above
-
-            if not hint:
-                self.node.get_logger().error("Manipulation issue but no hint_obstacle in failure_context")
-                self.planning_state = PlanningState.FAILED
-                return False
-
-            obstacle = hint
-
-        if not obstacle:
-            self.node.get_logger().error("No blocking obstacle resolved for manipulation")
+        # ============================================================
+        # DETERMINISTIC: Use fixed obstacle order
+        # ============================================================
+        if self.current_obstacle_index >= len(self.obstacle_order):
+            self.node.get_logger().error("All obstacles exhausted! No more obstacles to handle.")
             self.planning_state = PlanningState.FAILED
             return False
 
-        self.node.get_logger().info(f"Handling manipulation issue with obstacle: {obstacle}")
+        obstacle = self.obstacle_order[self.current_obstacle_index]
+        self.current_obstacle_index += 1
 
-        manip_graph = self.aog_module.expand_graph_for_manipulation(obstacle, self.q_goal)
+        self.node.get_logger().info(
+            f"[DETERMINISTIC] Using obstacle '{obstacle}' "
+            f"(index {self.current_obstacle_index}/{len(self.obstacle_order)})"
+        )
+        # ============================================================
+
+        manip_graph = self.aog_module.expand_graph_for_manipulation(
+            obstacle,
+            self.q_goal,
+            include_final=include_final
+        )
         self.graph_network.append(manip_graph)
         self.current_graph_index = len(self.graph_network) - 1
-        visualize_graph_structure_graphviz(manip_graph, f"plan_graph_{len(self.graph_network)}")
-        return True
 
+        # ---- META graph: add CHILD/PARENT2 plan cluster + link ----
+        parent_uid = self.current_plan_uid  # jis plan se spawn hua
+
+        self.plan_uid_counter += 1
+        child_uid = self.plan_uid_counter
+        self.current_plan_uid = child_uid   # now we are in this new plan
+
+        # Title decide (optional)
+        plan_title = "PARENT PLAN 2" if include_final else "CHILD PLAN"
+        self._meta_add_plan_cluster(manip_graph, child_uid, title=plan_title)
+
+        # label: obstacle + reason (best effort)
+        ctx = getattr(result, "failure_context", {}) or {}
+        reason = ctx.get("reason", result.failure_type)
+        self._meta_link_plans(parent_uid, child_uid, label=f"{reason} | obstacle={obstacle}")
+
+        self._meta_render()
+        return True
     
+
+
+    def _handle_manipulation_issue(self, result, include_final: bool):
+        if result.new_position:
+            self.q_current = result.new_position
+
+        # ============================================================
+        # DETERMINISTIC: Use fixed obstacle order
+        # ============================================================
+        if self.current_obstacle_index >= len(self.obstacle_order):
+            self.node.get_logger().error("All obstacles exhausted! No more obstacles to handle.")
+            self.planning_state = PlanningState.FAILED
+            return False
+
+        obstacle = self.obstacle_order[self.current_obstacle_index]
+        self.current_obstacle_index += 1
+
+        self.node.get_logger().info(
+            f"[DETERMINISTIC] Using obstacle '{obstacle}' "
+            f"(index {self.current_obstacle_index}/{len(self.obstacle_order)})"
+        )
+        # ============================================================
+
+        manip_graph = self.aog_module.expand_graph_for_manipulation(
+            obstacle,
+            self.q_goal,
+            include_final=include_final
+        )
+        self.graph_network.append(manip_graph)
+        self.current_graph_index = len(self.graph_network) - 1
+
+        # ---- META graph: add CHILD/PARENT2 plan cluster + link ----
+        parent_uid = self.current_plan_uid  # jis plan se spawn hua
+
+        self.plan_uid_counter += 1
+        child_uid = self.plan_uid_counter
+        self.current_plan_uid = child_uid   # now we are in this new plan
+
+        # Title decide (optional)
+        plan_title = "PARENT PLAN 2" if include_final else "CHILD PLAN"
+        self._meta_add_plan_cluster(manip_graph, child_uid, title=plan_title)
+
+        # label: obstacle + reason (best effort)
+        ctx = getattr(result, "failure_context", {}) or {}
+        reason = ctx.get("reason", result.failure_type)
+        self._meta_link_plans(parent_uid, child_uid, label=f"{reason} | obstacle={obstacle}")
+
+        self._meta_render()
+        return True
+        
 
     
     
@@ -2162,8 +2368,18 @@ class VANAMOPlanner:
         return False
     
     def is_goal_reached(self):
-        """Check if goal is reached"""
-        return self.task_completed() #and self.at_goal_position()
+        """Global goal reached ONLY when Parent Plan with N_FINAL completes"""
+        if not self.graph_network:
+            return False
+        
+        current_graph = self.graph_network[self.current_graph_index]
+        final_node = current_graph.get_node("N_FINAL")
+        
+        # No N_FINAL = Child Plan = NOT global goal
+        if final_node is None:
+            return False
+        
+        return final_node.status == "ACHIEVED"
     
     def at_goal_position(self):
         """Check if robot is at goal position"""
@@ -2173,13 +2389,22 @@ class VANAMOPlanner:
         )
         return distance < self.position_threshold
     
-    def task_completed(self):
-        """Check if task is completed based on graph state"""
+    def task_completed(self) -> bool:
+        """Current plan (child or parent) completed?"""
         if not self.graph_network:
             return False
+        
         current_graph = self.graph_network[self.current_graph_index]
+        
+        # Check N_FINAL first (Parent Plans)
         final_node = current_graph.get_node("N_FINAL")
-        return final_node and final_node.status == "ACHIEVED"
+        if final_node:
+            return final_node.status == "ACHIEVED"
+        
+        # No N_FINAL = Child Plan, check N_MANIPULATION_DONE
+        manip_done = current_graph.get_node("N_MANIPULATION_DONE")
+        return bool(manip_done and manip_done.status == "ACHIEVED")
+
     
     def _get_state_key(self, position, target):
         """Create unique key for state to detect cycles"""
@@ -2217,13 +2442,6 @@ class VANAMOPlannerNode(Node):
         # Create a ReentrantCallbackGroup
         self.callback_group = ReentrantCallbackGroup()
         
-        # Subscribe to odometry
-        # self.odom_sub = self.create_subscription(
-        #     Odometry,
-        #     '/diff_cont/odom',
-        #     self.odom_callback, 
-        #     10, callback_group=self.callback_group
-        # )
 
 
         # Declare parameters

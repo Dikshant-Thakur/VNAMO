@@ -1,4 +1,5 @@
 # REQUEST  -------------------------------------------------
+string obstacle_name   # <-- NEW
 float64 box_x      # obstacle center X (map frame)
 float64 box_y      # obstacle center Y (map frame)
 float64 box_l      # obstacle length (X side)
