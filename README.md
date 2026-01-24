@@ -13,20 +13,6 @@ High-Level Logic Flow
 5. Manipulation: Depending on the obstacle type push/pull action will be done.
 6. Resume: The graph updates, and the robot continues to the goal.
 
-graph TD
-    Planner[VANAMO Planner<br>(AOG & GNS Engine)] -->|Action| Nav2[Nav2 Stack]
-    Planner -->|Action| ObsServer[Observe Obstacle Server]
-    Planner -->|Action| VisServer[Visibility Action Server]
-    Planner -->|Action| ManipServer[Manipulation Dispatcher]
-    
-    ObsServer -->|Sub| YOLO[YOLOv8 Detector]
-    VisServer -->|Sub| PointCloud[Realsense PointCloud]
-    
-    ManipServer -->|Service| PushGeom[Push Geometry Server]
-    ManipServer -->|Service| PullGeom[Pull Geometry Server]
-    
-    ManipServer -->|Action| PushAct[Push Action Server]
-    ManipServer -->|Action| PullAct[Pull Action Server]
 
 ## Installation
 
