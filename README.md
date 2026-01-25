@@ -13,6 +13,9 @@ High-Level Logic Flow
 5. Manipulation: Depending on the obstacle type push/pull action will be done.
 6. Resume: The graph updates, and the robot continues to the goal.
 
+ ### Planner Architecture
+<img width="2185" height="1349" alt="VNMAO_Architecture" src="https://github.com/user-attachments/assets/9e06fe0d-b60e-4305-8a86-366674729f44" />
+
 
 ## Installation
 
