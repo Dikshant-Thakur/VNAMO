@@ -16,6 +16,9 @@ High-Level Logic Flow
  ### Planner Architecture
 <img width="2185" height="1349" alt="VNMAO_Architecture" src="https://github.com/user-attachments/assets/9e06fe0d-b60e-4305-8a86-366674729f44" />
 
+### Action Stack Architecture
+<img width="720" height="631" alt="Action2Stack" src="https://github.com/user-attachments/assets/d250a6ee-7648-4f6e-89ce-5aecd4e32665" />
+
 
 ## Installation
 
