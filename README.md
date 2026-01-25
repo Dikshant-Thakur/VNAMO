@@ -1,15 +1,21 @@
-This repository contains a ROS 2 Humble package for simulating a **MiR 250 (Mobile Industrial Robot)** equipped with a **Universal Robots (UR5e)** arm and a **Robotiq Gripper**.
+## VANAMO: Visibility-Aware Navigation Among Movable Obstacles
+VANAMO is a ROS 2 based framework for mobile manipulation that solves the Navigation Among Movable Obstacles (NAMO) problem. Unlike traditional NAMO approaches, VANAMO introduces Visibility Constraints—ensuring that the robot verifies the target space is free before attempting to move an obstacle.
 
-The project integrates **Navigation2**, **SLAM Toolbox**, and **YOLOv8** for autonomous navigation and object detection in a Gazebo environment.
+The system utilizes an AND/OR Graph (AOG) architecture with Graph Network Search (GNS) to dynamically switch between Navigation, Observation, Visibility Checks, and Manipulation (Push/Pull) behaviors.
 
-## Key Features
-* **Base Setup:** Derived from the robust [mir250_robot_ros2](https://github.com/Rudresh172/mir250_robot_ros2) structure.
-* **Sensor Fusion:** Merges dual laser scanners (Front & Back) using `ira_laser_tools` for 360° coverage.
-* **Perception:** Real-time object detection using **YOLOv8** (CUDA-accelerated) via `ros2_run`.
-* **Manipulation:** UR5e arm control with MoveIt and `ros2_control`.
-* **Synchronization:** Implements `twist_stamper` to fix TF synchronization issues for velocity commands.
+## System Architecture
+The system is designed as a hierarchical planner that orchestrates various Action Servers and Service Nodes.
+High-Level Logic Flow
+1. Global Navigation: The robot attempts to reach a goal using standard Nav2.
+2. Failure Analysis: If the path is blocked, the planner identifies the blocking obstacle.
+3. Observation: The robot positions its arm to detect the object (YOLOv8) and determines if it is Push_Movable or Pull_Movable.
+4. Visibility Check: Before manipulation, the robot performs a "Look-Before-You-Sweep" check using PointClouds to ensure the area behind the object (L* corridor) is empty.
+5. Manipulation: Depending on the obstacle type push/pull action will be done.
+6. Resume: The graph updates, and the robot continues to the goal.
 
----
+ ### Planner Architecture
+<img width="2185" height="1349" alt="VNMAO_Architecture" src="https://github.com/user-attachments/assets/9e06fe0d-b60e-4305-8a86-366674729f44" />
+
 
 ## Installation
 
