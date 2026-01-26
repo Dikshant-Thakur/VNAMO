@@ -1,3 +1,27 @@
+# 🚀 Planner Architectures & Branching Strategy
+
+This repository hosts two distinct planning algorithms across different branches. Specifically, the `recursive` branch introduces a hierarchical approach to problem-solving compared to the iterative nature of `master`.
+
+### Comparison Table
+
+| Feature | `master` Branch (Iterative) | `recursive` Branch (Hierarchical) |
+| :--- | :--- | :--- |
+| **Core Logic** | **Sequential / Reactive** | **Recursive / Nested** |
+| **Obstacle Handling** | Detects obstacle $\rightarrow$ Aborts current plan $\rightarrow$ Generates a completely new plan for the new state. | Detects obstacle $\rightarrow$ Pauses current plan $\rightarrow$ Creates a **Child Plan** to remove the obstacle $\rightarrow$ Resumes Parent Plan. |
+| **Solving Style** | Linear Replanning | **Recursive Recovery Strategy** (Backward Chaining) |
+| **Complexity** | Low (Best for simple, changing environments) | High (Best for complex, inter-dependent tasks) |
+
+---
+
+### 🧠 Logic Flow Visualization
+
+#### 1. Iterative Approach (`master`)
+> Make Plan A $\rightarrow$ Hit Obstacle $\rightarrow$ ❌ **Discard Plan A** $\rightarrow$ Make Plan B from scratch.
+
+#### 2. Recursive Approach (`recursive`)
+> Plan A (blocked by X) $\rightarrow$ ⏸️ **Pause Plan A** $\rightarrow$ Create **Child Plan B** (to remove X) $\rightarrow$ ✅ Execute B $\rightarrow$ ▶️ **Resume Plan A**.
+
+
 ## VANAMO: Visibility-Aware Navigation Among Movable Obstacles
 VANAMO is a ROS 2 based framework for mobile manipulation that solves the Navigation Among Movable Obstacles (NAMO) problem. Unlike traditional NAMO approaches, VANAMO introduces Visibility Constraints—ensuring that the robot verifies the target space is free before attempting to move an obstacle.
 
