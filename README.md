@@ -27,7 +27,7 @@ High-Level Logic Flow
 </details>
 
 <details>
-  <summary><strong>❌ Plan 2 (For Table - Push Obstacle) -> Fail</strong></summary>
+  <summary><strong>❌ Plan 2 (For Red Box - Push Obstacle) -> Fail</strong></summary>
   <img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="450" />
 </details>
 
@@ -36,7 +36,7 @@ High-Level Logic Flow
   <img src="https://github.com/user-attachments/assets/5fcd1835-bff9-4d7f-af07-f3d924461e00" width="450" />
 </details>
 
-### ✅ Plan 4 (For Table - Pull Obstacle)
+### ✅ Plan 4 (For Red Box - Push Obstacle)
 <img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="450" />
 ### Video
 
