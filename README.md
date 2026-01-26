@@ -19,14 +19,25 @@ High-Level Logic Flow
 ### Action Stack Architecture
 <img width="720" height="631" alt="Action2Stack" src="https://github.com/user-attachments/assets/d250a6ee-7648-4f6e-89ce-5aecd4e32665" />
 
+### Planner Scenarios (Non-recursive Nature)
 
-| Plan 1 (Failure) | Plan 2 (Push Obstacle - Fail) |
-| :---: | :---: |
-| <img src="https://github.com/user-attachments/assets/10f66d62-7f69-4d5f-be03-9f491c1789b5" width="400"> | <img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="400"> |
+<details>
+  <summary><strong>❌ Plan 1 -> Failure</strong> (Click to Expand)</summary>
+  <img src="https://github.com/user-attachments/assets/10f66d62-7f69-4d5f-be03-9f491c1789b5" width="450" />
+</details>
 
-| Plan 3 (Pull Obstacle - Fail) | Plan 4 (Pull Obstacle - Success) |
-| :---: | :---: |
-| <img src="https://github.com/user-attachments/assets/5fcd1835-bff9-4d7f-af07-f3d924461e00" width="400"> | <img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="400"> |
+<details>
+  <summary><strong>❌ Plan 2 (For Table - Push Obstacle) -> Fail</strong></summary>
+  <img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="450" />
+</details>
+
+<details>
+  <summary><strong>❌ Plan 3 (For Chair - Pull Obstacle) -> Fail</strong></summary>
+  <img src="https://github.com/user-attachments/assets/5fcd1835-bff9-4d7f-af07-f3d924461e00" width="450" />
+</details>
+
+### ✅ Plan 4 (For Table - Pull Obstacle)
+<img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="450" />
 ### Video
 
 
