@@ -2,12 +2,22 @@
 
 This repository hosts two distinct planning algorithms across different branches. Here is how they differ:
 
-| Feature | `master` Branch (Iterative) | `recursive` Branch (Hierarchical) |
-| :--- | :--- | :--- |
-| **Core Logic** | **Sequential / Reactive** | **Recursive / Nested** |
-| **Obstacle Handling** | Detects obstacle $\rightarrow$ Aborts current plan $\rightarrow$ Generates a completely new plan for the new state. | Detects obstacle $\rightarrow$ Pauses current plan $\rightarrow$ Creates a **Child Plan** to remove the obstacle $\rightarrow$ Resumes Parent Plan. |
-| **Solving Style** | Linear Replanning | **Hierarchical Sub-goal Decomposition** (Backward Chaining) |
-| **Complexity** | Low (Good for simple, changing environments) | High (Good for complex, inter-dependent tasks) |
+## 🚀 Planner Architectures
+
+Currently, the repository maintains two approaches to obstacle handling:
+
+### 1. The Iterative Planner (`master` branch)
+* **Nature:** Non-Recursive / Linear.
+* **Behavior:** It treats every obstacle as a trigger to re-calculate the path.
+* **Flow:**
+    > Make Plan A $\rightarrow$ Hit Obstacle $\rightarrow$ **Discard Plan A** $\rightarrow$ Make Plan B from scratch.
+
+### 2. The Recursive Planner (`recursive-feature` branch)
+* **Nature:** Recursive Sub-goal Decomposition.
+* **Behavior:** Implements a "Stack-based" solving approach. If a plan fails, it doesn't discard it. Instead, it pushes the failure as a new "Child Goal" onto the stack.
+* **Flow:**
+    > Plan A (blocked by X) $\rightarrow$ **Pause Plan A** $\rightarrow$ Create **Child Plan B** (to remove X) $\rightarrow$ Execute B $\rightarrow$ **Resume Plan A**.
+* **Advantage:** Capable of solving complex dependency chains (e.g., *Move chair to open door to reach table*).
 
 ---
 ## VANAMO: Visibility-Aware Navigation Among Movable Obstacles
