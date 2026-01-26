@@ -9,7 +9,6 @@ This repository hosts two distinct planning algorithms across different branches
 | **Core Logic** | **Sequential / Reactive** | **Recursive / Nested** |
 | **Obstacle Handling** | Detects obstacle $\rightarrow$ Aborts current plan $\rightarrow$ Generates a completely new plan for the new state. | Detects obstacle $\rightarrow$ Pauses current plan $\rightarrow$ Creates a **Child Plan** to remove the obstacle $\rightarrow$ Resumes Parent Plan. |
 | **Solving Style** | Linear Replanning | **Recursive Recovery Strategy** (Backward Chaining) |
-| **Complexity** | Low (Best for simple, changing environments) | High (Best for complex, inter-dependent tasks) |
 
 ---
 
