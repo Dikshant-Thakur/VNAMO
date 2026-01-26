@@ -1,4 +1,4 @@
-## VANAMO: Visibility-Aware Navigation Among Movable Obstacles
+<img width="3160" height="1800" alt="Blank diagram" src="https://github.com/user-attachments/assets/5503601c-49eb-4a93-9bef-13dd424b7698" />## VANAMO: Visibility-Aware Navigation Among Movable Obstacles
 VANAMO is a ROS 2 based framework for mobile manipulation that solves the Navigation Among Movable Obstacles (NAMO) problem. Unlike traditional NAMO approaches, VANAMO introduces Visibility Constraints—ensuring that the robot verifies the target space is free before attempting to move an obstacle.
 
 The system utilizes an AND/OR Graph (AOG) architecture with Graph Network Search (GNS) to dynamically switch between Navigation, Observation, Visibility Checks, and Manipulation (Push/Pull) behaviors.
@@ -14,7 +14,7 @@ High-Level Logic Flow
 6. Resume: The graph updates, and the robot continues to the goal.
 
  ### Planner Architecture
-<img width="2185" height="1349" alt="VNMAO_Architecture" src="https://github.com/user-attachments/assets/9e06fe0d-b60e-4305-8a86-366674729f44" />
+<img width="3160" height="1800" alt="Blank diagram" src="https://github.com/user-attachments/assets/c08ffdab-9fe6-40e8-990c-f63c09a9a02b" />
 
 ### Action Stack Architecture
 <img width="720" height="631" alt="Action2Stack" src="https://github.com/user-attachments/assets/d250a6ee-7648-4f6e-89ce-5aecd4e32665" />
