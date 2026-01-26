@@ -26,13 +26,13 @@ High-Level Logic Flow
 
 
 ### Plan_2 (For Table - Push Obstacle) -> Fail 
-<img width="839" height="1349" alt="plan_graph_2" src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" />
+<img width="451" height="1349" alt="plan_graph_2" src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" />
 
 #### Plan_3 (For Chair - Pull Obstacle) -> Fail 
-<img width="839" height="1349" alt="plan_graph_2" src="https://github.com/user-attachments/assets/5fcd1835-bff9-4d7f-af07-f3d924461e00" />
+<img width="451" height="1349" alt="plan_graph_2" src="https://github.com/user-attachments/assets/5fcd1835-bff9-4d7f-af07-f3d924461e00" />
 
 ### Plan_4 (For Table - Pull Obstacle)
-<img width="839" height="1349" alt="plan_graph_2" src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" />
+<img width="451" height="1349" alt="plan_graph_2" src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" />
 
 ### Video
 
