@@ -35,9 +35,9 @@ High-Level Logic Flow
 4. Visibility Check: Before manipulation, the robot performs a "Look-Before-You-Sweep" check using PointClouds to ensure the area behind the object (L* corridor) is empty.
 5. Manipulation: Depending on the obstacle type push/pull action will be done.
 6. Resume: The graph updates, and the robot continues to the goal.
-
+7. 
  ### Planner Architecture
-<img width="2185" height="1349" alt="VNMAO_Architecture" src="https://github.com/user-attachments/assets/9e06fe0d-b60e-4305-8a86-366674729f44" />
+ <img width="3160" height="1800" alt="Blank diagram" src="https://github.com/user-attachments/assets/b5c0d371-4576-4206-99db-b4c50f7fe0b6" />
 
 ### Action Stack Architecture
 <img width="720" height="631" alt="Action2Stack" src="https://github.com/user-attachments/assets/d250a6ee-7648-4f6e-89ce-5aecd4e32665" />
