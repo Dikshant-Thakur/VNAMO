@@ -15,7 +15,7 @@ This repository hosts two distinct planning algorithms across different branches
 ### Logic Flow Visualization
 
 #### 1. Iterative Approach (`master`)
-> Make Plan A $\rightarrow$ Hit Obstacle $\rightarrow$ ❌ **Discard Plan A** $\rightarrow$ Make Plan B from scratch.
+> Make Plan A $\rightarrow$ Hit Obstacle $\rightarrow$  **Discard Plan A** $\rightarrow$ Make Plan B from scratch.
 
 #### 2. Recursive Approach (`recursive`)
 > Plan A (blocked by X) $\rightarrow$  **Pause Plan A** $\rightarrow$ Create **Child Plan B** (to remove X) $\rightarrow$  Execute B $\rightarrow$  **Resume Plan A**.
