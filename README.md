@@ -1,4 +1,4 @@
-# 🚀 Planner Architectures & Branching Strategy
+# Planner Architectures & Branching Strategy
 
 This repository hosts two distinct planning algorithms across different branches. Specifically, the `recursive` branch introduces a hierarchical approach to problem-solving compared to the iterative nature of `master`.
 
@@ -12,7 +12,7 @@ This repository hosts two distinct planning algorithms across different branches
 
 ---
 
-### 🧠 Logic Flow Visualization
+### Logic Flow Visualization
 
 #### 1. Iterative Approach (`master`)
 > Make Plan A $\rightarrow$ Hit Obstacle $\rightarrow$  **Discard Plan A** $\rightarrow$ Make Plan B from scratch.
