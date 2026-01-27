@@ -124,6 +124,6 @@ Acknowledgements & Credits
 * **Universal Robots:** [Universal_Robots_ROS2_Description](https://github.com/UniversalRobots/Universal_Robots_ROS2_Description)[cite: 21].
 * **Laser Tools:** [dual_laser_merger](https://github.com/pradyum/dual_laser_merger)[cite: 2].
 
-## Video - Glimpse of Computer Vision + Navigation of Mir + Ur5e.
+## Video - Glimpse of YOLO + Motion Planning of mobile robot
 https://github.com/user-attachments/assets/84e8e1ee-dfe1-44b1-96c8-f438b1279440
 
