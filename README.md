@@ -46,21 +46,21 @@ High-Level Logic Flow
 ### Planner Scenarios (Non-recursive Nature)
 
 <details>
-  <summary><strong>❌ Plan 1 -> Failure</strong> (Click to Expand)</summary>
+  <summary><strong> Plan 1 -> Failure</strong> (Click to Expand)</summary>
   <img src="https://github.com/user-attachments/assets/10f66d62-7f69-4d5f-be03-9f491c1789b5" width="450" />
 </details>
 
 <details>
-  <summary><strong>❌ Plan 2 (For Red Box - Push Obstacle) -> Fail</strong></summary>
+  <summary><strong>Plan 2 (For Red Box - Push Obstacle) -> Fail</strong></summary>
   <img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="450" />
 </details>
 
 <details>
-  <summary><strong>❌ Plan 3 (For Chair - Pull Obstacle) -> Fail</strong></summary>
+  <summary><strong> Plan 3 (For Chair - Pull Obstacle) -> Fail</strong></summary>
   <img src="https://github.com/user-attachments/assets/5fcd1835-bff9-4d7f-af07-f3d924461e00" width="450" />
 </details>
 
-### ✅ Plan 4 (For Red Box - Push Obstacle)
+### Plan 4 (For Red Box - Push Obstacle)
 <img src="https://github.com/user-attachments/assets/828e5173-f6e5-4107-a3da-fcc30b758d8a" width="450" />
 
 ### Video
